@@ -147,6 +147,17 @@
 	</Field>
 	<Field id="simpleSeparator7" type="separator"/>
 
+	<Field id="ElevenLabsNote" type="label" fontColor="darkgray" fontSize="small" alignWithControl="false">
+		<Label>Check this box if you have an account with ElevenLabs and wish to use it for group announcements. [https://elevenlabs.io]</Label>
+	</Field>
+	<Field type="checkbox" id="ElevenLabs" tooltip="ElevenLabs account?">
+		<Label>ElevenLabs:</Label>
+	</Field>
+	<Field type="textfield" id="ElevenLabsAPIKey" tooltip="ElevenLabs API key" visibleBindingId="ElevenLabs" visibleBindingValue="true">
+		<Label>API key:</Label>
+	</Field>
+	<Field id="simpleSeparator8" type="separator"/>
+
 	<Field id="MSTranslateNote" type="label" fontColor="darkgray" fontSize="small" alignWithControl="false">
 		<Label>Check this box if you have registered a user account with Microsoft Translate and wish to use it for group announcements. [https://www.microsoft.com/en-us/translator/getstarted.aspx]</Label>
 	</Field>
@@ -159,7 +170,7 @@
 	<Field type="textfield" id="MSTranslateClientSecret" tooltip="MS Translate Client Secret" visibleBindingId="MSTranslate" visibleBindingValue="true">
         	<Label>Client Secret:</Label>
 	</Field>
-	<Field id="simpleSeparator8" type="separator"/>
+	<Field id="simpleSeparator9" type="separator"/>
 
 	<Field id="UpdaterEmailsEnabledNote" type="label" fontColor="darkgray" fontSize="small" alignWithControl="false">
 		<Label>Check this box if you want to enable version update notifications. Email sending must also be configured in Indigo's preferences.</Label>
@@ -173,7 +184,7 @@
 	<Field id="updaterEmail" type="textfield" visibleBindingId="updaterEmailsEnabled" visibleBindingValue="true">
 		<Label>Email:</Label>
 	</Field>
-	<Field id="simpleSeparator9" type="separator"/>
+	<Field id="simpleSeparator10" type="separator"/>
 
 	<Field id="showDebugInLogNote" type="label" fontColor="darkgray" fontSize="small" alignWithControl="false">
 		<Label>Check the boxes below for additional information to log to the Indigo Event Log.  Basic Debugging must be checked for any other deubgging to function.</Label>
