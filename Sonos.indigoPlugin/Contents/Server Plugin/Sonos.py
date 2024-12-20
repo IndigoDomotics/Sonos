@@ -226,6 +226,17 @@ IVONAlanguages = {'en-US': 'English, American',
 IVONAVoices = []
 PollyVoices = []
 NSVoices = []
+ElevenLabsVoices = []
+
+
+class ElevenLabsVoice:
+    def __init__(self, voice_id, name, gender):
+        self.id = voice_id
+        self.name = name
+        self.gender = gender
+
+    def __repr__(self):
+        return f"ElevenLabsVoice(id='{self.id}', name='{self.name}', gender='{self.gender}')"
 
 
 class PA():
@@ -335,6 +346,8 @@ class Sonos(object):
         self.MSTranslate = None
         self.MSTranslateClientID = None
         self.MSTranslateClientSecret = None
+        self.ElevenLabs = None
+        self.ElevenLabsAPIKey = None
         self.ttsORfile = None
         self.deviceList = []
         self.ZonePlayers = []
@@ -896,6 +909,32 @@ class Sonos(object):
 
         except Exception as exception_error:
             self.exception_handler(exception_error, True)  # Log error and display failing statement
+
+    def ElevenLabsVoices(self):
+        self.logger.debug("Will fetch ElevenLabs voices...")
+        try:
+            global ElevenLabsVoices
+            voice_count = 0
+            headers = {
+                "xi-api-key": self.ElevenLabsAPIKey
+            }
+            response = requests.get("https://api.elevenlabs.io/v1/voices", headers=headers)
+            if response.status_code == 200:
+                for voice in response.json()['voices']:
+                    # If gender is not available, it's unknown
+                    gender = voice.get("labels", {}).get("gender", "unknown")
+                    voice_obj = ElevenLabsVoice(
+                        voice["voice_id"],
+                        voice["name"],
+                        gender
+                    )
+                    ElevenLabsVoices.append(voice_obj)
+                    self.logger.debug(f"ElevenLabs voice: {voice_obj}")
+                    voice_count = voice_count + 1
+                self.logger.info(f"Loaded ElevenLabs voices... [{voice_count}]")
+        except Exception as exception_error:
+            self.exception_handler(exception_error, True)  # Log error and display failing statement
+
 
     def PollyVoices(self):
         try:
@@ -2575,6 +2614,42 @@ class Sonos(object):
                     s_announcement = "announcement.mp3"
                     tts_delay = 0.5
 
+                elif pluginAction.props.get("ttsORfile") == "ELEVENLABS":
+                    # Get the message to read
+                    announcement = self.plugin.substitute(pluginAction.props.get("ELEVENLABS_setting"), validateOnly=False)
+                    # Get the language code (needed for API)
+                    language_code = self.plugin.substitute(pluginAction.props.get("ELEVENLABS_language"), validateOnly=False)
+                    # Find the voice id that the user selected
+                    voice_id: str = pluginAction.props.get("ELEVENLABS_voice")
+                    # POST headers and data
+                    headers = {
+                        "Accept": "audio/mpeg",
+                        "Content-Type": "application/json",
+                        "xi-api-key": self.ElevenLabsAPIKey
+                    }
+                    data = {
+                        "text": announcement,
+                        "language_code": language_code,
+                        "model_id": "eleven_turbo_v2_5",
+                        "voice_settings": {
+                            "stability": 0.5,
+                            "similarity_boost": 0.5
+                        }
+                    }
+                    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+                    response = requests.post(url, json=data, headers=headers)
+                    if response.status_code == 200:
+                        CHUNK_SIZE = 1024
+                        with open('announcement.mp3', 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                                if chunk:
+                                    f.write(chunk)
+                        s_announcement = "announcement.mp3"
+                        tts_delay = 0.5
+                    else:
+                        self.logger.error("Unable to synthesize speech at ElevenLabs")
+
+
                 elif pluginAction.props.get("ttsORfile") == "APPLE":
                     announcement = self.plugin.substitute(pluginAction.props.get("APPLE_setting"), validateOnly=False)
                     sp = NSSpeechSynthesizer.alloc().initWithVoice_(pluginAction.props.get("APPLE_voice"))
@@ -3069,6 +3144,20 @@ class Sonos(object):
                 except Exception as exception_error:
                     self.logger.error(f"[{time.asctime()}] Could not retrieve Polly parameters.")
 
+
+                # Setup ElevenLabs option if available
+                try:
+                    prefs = self.plugin.pluginPrefs
+                    if (self.ElevenLabs != prefs['ElevenLabs'] or
+                            self.ElevenLabsAPIKey != prefs['ElevenLabsAPIKey']):
+                        self.ElevenLabs = prefs['ElevenLabs']
+                        if self.ElevenLabs:
+                            self.ElevenLabsAPIKey = prefs['ElevenLabsAPIKey']
+                            self.ElevenLabsVoices()
+                except Exception:
+                    self.logger.error(f"[{time.asctime()}] Could not retrieve ElevenLabs parameters.")
+
+
                 try:
                     if (self.MSTranslate != self.plugin.pluginPrefs['MSTranslate']) or \
                             (self.MSTranslateClientID != self.plugin.pluginPrefs['MSTranslateClientID']) or \
@@ -3253,6 +3342,20 @@ class Sonos(object):
 
         except Exception as exception_error:
             self.exception_handler(exception_error, True)  # Log error and display failing statement
+
+    def getElevenLabsVoices(self, filter=""):
+        try:
+            voice_list = []
+            for voice in ElevenLabsVoices:
+                voice_info = (voice.id, voice.name)
+                voice_list.append(voice_info)
+            # Sort the displayed voice list by speaker name
+            voice_list.sort(key=lambda x: x[1])
+
+            return voice_list
+
+        except Exception as exception_error:
+            self.exception_handler(exception_error, True)
 
     def getAppleVoices(self, filter=""):
         try:

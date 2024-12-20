@@ -499,6 +499,7 @@
 				<List>
 					<Option value="FILE">File</Option>
 					<Option value="POLLY">Amazon Polly</Option>
+					<Option value="ELEVENLABS">ElevenLabs</Option>
 					<Option value="APPLE">Apple Speech</Option>					
 					<Option value="TTS">Google Text To Speech</Option>
 					<Option value="IVONA">IVONA Text To Speech</Option>
@@ -659,6 +660,20 @@
 			<Field id="POLLY_voice" type="menu" visibleBindingId="ttsORfile" visibleBindingValue="POLLY">
 				<Label>Voice:</Label>
 				<List class="self" method="getPollyVoices" dynamicReload="yes"/>
+			</Field>
+
+			<!-- ElevenLabs TTS message to read -->
+			<Field id="ELEVENLABS_setting" type="textfield" visibleBindingId="ttsORfile" visibleBindingValue="ELEVENLABS">
+				<Label>Message:</Label>
+			</Field>
+			<!-- Voice selection dropdown -->
+			<Field id="ELEVENLABS_voice" type="menu" visibleBindingId="ttsORfile" visibleBindingValue="ELEVENLABS">
+				<Label>Voice:</Label>
+				<List class="self" method="getElevenLabsVoices" dynamicReload="yes"/>
+			</Field>
+			<!-- ElevenLabs language code input -->
+			<Field id="ELEVENLABS_language" type="textfield" visibleBindingId="ttsORfile" visibleBindingValue="ELEVENLABS">
+				<Label>Language code (e.g. "en"):</Label>
 			</Field>
 
 			<Field id="APPLE_setting" type="textfield" visibleBindingId="ttsORfile" visibleBindingValue="APPLE">
