@@ -147,12 +147,14 @@
 	</Field>
 	<Field id="simpleSeparator7" type="separator"/>
 
+	<!-- ElevenLabs TTS options -->
 	<Field id="ElevenLabsNote" type="label" fontColor="darkgray" fontSize="small" alignWithControl="false">
 		<Label>Check this box if you have an account with ElevenLabs and wish to use it for group announcements. [https://elevenlabs.io]</Label>
 	</Field>
 	<Field type="checkbox" id="ElevenLabs" tooltip="ElevenLabs account?">
 		<Label>ElevenLabs:</Label>
 	</Field>
+	<!-- ElevenLabs API key - visible only if main option checked -->
 	<Field type="textfield" id="ElevenLabsAPIKey" tooltip="ElevenLabs API key" visibleBindingId="ElevenLabs" visibleBindingValue="true">
 		<Label>API key:</Label>
 	</Field>

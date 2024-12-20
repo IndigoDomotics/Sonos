@@ -450,6 +450,9 @@ class Plugin(indigo.PluginBase):
     def getPollyVoices(self, filter="", valuesDict=None, typeId="", targetId=0):
         return self.Sonos.getPollyVoices()
 
+    def getElevenLabsVoices(self, filter="", valuesDict=None, typeId="", targetId=0):
+        return self.Sonos.getElevenLabsVoices()
+
     def getAppleVoices(self, filter="", valuesDict=None, typeId="", targetId=0):
         return self.Sonos.getAppleVoices()
 
