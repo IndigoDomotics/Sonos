@@ -1,0 +1,84 @@
+# ========================
+# Indigo Plugin Safe .gitignore
+# ========================
+
+# macOS cruft
+.DS_Store
+*.swp
+
+# Compiled Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Plugin build artifacts
+*.zip
+*.tar.gz
+*.egg-info/
+*.egg
+*.manifest
+
+# Plugin output artifacts or local installs
+dist/
+build/
+.eggs/
+develop-eggs/
+.installed.cfg
+
+# Coverage and testing
+.tox/
+.coverage
+coverage.xml
+.cache
+pytest_cache/
+htmlcov/
+
+# venvs or local environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE and tool junk
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# ================
+# Indigo Plugin Structure
+# ================
+
+# Ignore all plugin internal caches, compiled files, and unwanted files
+Sonos.indigoPlugin/**/__pycache__/
+Sonos.indigoPlugin/**/*.pyc
+Sonos.indigoPlugin/**/*.pyo
+
+# Keep plugin source files
+!Sonos.indigoPlugin/Contents/
+!Sonos.indigoPlugin/Contents/**/*.py
+!Sonos.indigoPlugin/Contents/**/*.xml
+!Sonos.indigoPlugin/Contents/**/*.json
+!Sonos.indigoPlugin/Contents/**/*.jpg
+!Sonos.indigoPlugin/Contents/**/*.mp3
+!Sonos.indigoPlugin/Contents/Info.plist
+
+# Keep full lxml C-extension folder
+!Sonos.indigoPlugin/Contents/Packages/lxml/
+!Sonos.indigoPlugin/Contents/Packages/lxml/**
+
+# Keep pandora.py and all plugin server scripts
+!Sonos.indigoPlugin/Contents/Server Plugin/pandora.py
+!Sonos.indigoPlugin/Contents/Server Plugin/*.py
+!Sonos.indigoPlugin/Contents/Server Plugin/*.xml
+!Sonos.indigoPlugin/Contents/Server Plugin/*.json
+!Sonos.indigoPlugin/Contents/Server Plugin/**/*.so
+
+# Keep requirements.txt
+!Sonos.indigoPlugin/Contents/Server Plugin/requirements.txt
+
+# Exclude other installed dist-info (optional)
+Sonos.indigoPlugin/Contents/Server Plugin/*.dist-info/
+Sonos.indigoPlugin/Contents/Packages/*.dist-info/
