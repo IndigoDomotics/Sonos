@@ -2,160 +2,7 @@
 # -*- coding: utf-8 -*-
 #
 
-
-# imports_successful = True
-
-# ============================== Native Imports ===============================
-import os
-import platform
-import sys
-import traceback
-import time
-# import aiohttp
-
-# =================== requirements.txt imports ==================
-import_errors = []
-try:
-    from twisted.internet import reactor
-    from twisted.internet.protocol import DatagramProtocol
-    from twisted.application.internet import MulticastServer
-except ImportError:
-    import_errors.append("twisted")
-
-try:
-    from gtts import gTTS
-except ImportError:
-    import_errors.append("gTTS")
-
-try:
-    import pyvona
-except ImportError:
-    import_errors.append("pyvona")
-
-try:
-    import boto3
-except ImportError:
-    import_errors.append("boto3")
-
-try:
-    from mutagen.mp3 import MP3
-    from mutagen.aiff import AIFF
-except ImportError:
-    import_errors.append("mutagen")
-
-try:
-    import urllib
-    import urllib.parse
-    from urllib.request import urlopen
-    import urllib.request
-except ImportError:
-    import_errors.append("urllib")
-
-# ============================== Custom Imports ===============================
-try:
-    # noinspection PyUnresolvedReferences
-    import indigo
-except ImportError:
-    pass
-
-from pandora import Pandora
-
-# ============================== Plugin Imports ===============================
-from constants import *
-
-from soco import SoCo
-
-
-indiPref_plugin_stopped = """<?xml version="1.0" encoding="UTF-8"?>
-<Prefs type="dict">
-    <plugin_stopped type="bool">true</plugin_stopped>
-</Prefs>
-
-"""
-
-
-class Plugin(indigo.PluginBase):
-
-
-    ######################################################################################
-    # class init & del
-    def __init__(self, pluginId, pluginDisplayName, pluginVersion, pluginPrefs):
-        indigo.PluginBase.__init__(self, pluginId, pluginDisplayName, pluginVersion, pluginPrefs)
-
-        # Initialise dictionary to store plugin Globals
-        self.globals = dict()
-
-        self.Sonos = None
-        self.pluginPrefs = pluginPrefs
-
-        # Initialise Indigo plugin info
-        self.globals[PLUGIN_INFO] = {}
-        self.globals[PLUGIN_INFO][PLUGIN_ID] = pluginId
-        self.globals[PLUGIN_INFO][PLUGIN_DISPLAY_NAME] = pluginDisplayName
-        self.globals[PLUGIN_INFO][PLUGIN_VERSION] = pluginVersion
-        self.globals[PLUGIN_INFO][PATH] = indigo.server.getInstallFolderPath()
-        self.globals[PLUGIN_INFO][API_VERSION] = indigo.server.apiVersion
-        self.globals[PLUGIN_INFO][ADDRESS] = indigo.server.address
-
-        # Setup logging
-        log_format = logging.Formatter("%(asctime)s.%(msecs)03d\t%(levelname)-12s\t%(name)s.%(funcName)-25s %(msg)s", datefmt="%Y-%m-%d %H:%M:%S")
-        self.plugin_file_handler.setFormatter(log_format)
-        self.plugin_file_handler.setLevel(LOG_LEVEL_INFO)  # Logging Level for plugin log file
-        self.indigo_log_handler.setLevel(LOG_LEVEL_INFO)   # Logging level for Indigo Event Log
-
-        self.logger = logging.getLogger("Plugin.Sonos")
-        self.logger.info("Plugin logging now started.")
-
-        self.debug = False
-        self.xmlDebug = False
-        self.eventsDebug = False
-        self.stateUpdatesDebug = False
-        self.StopThread = False
-
-        # ✅ Instantiate SonosPlugin here
-        try:
-            from Sonos import SonosPlugin
-            self.Sonos = SonosPlugin(self, self.pluginPrefs)
-            # plugin.py
-        except Exception as e:
-            self.logger.error(f"❌ Failed to initialize SonosPlugin: {e}")
-            self.Sonos = None
-
-        self.logger.info("Plugin __init__ ended.")
-
-        self.last_siriusxm_guid_by_dev = {}
-
-
-    def __del__(self):
-        indigo.PluginBase.__del__(self)
-
-    ######################################################################################
-
-
-###
-
-    def actionSetSiriusXMChannel(self, pluginAction, dev):
-        chan_id = pluginAction.props.get("channelSelector", "").strip()
-        self.logger.info(f"🎧 User selected SiriusXM channel ID: '{chan_id}'")
-
-        self.logger.debug(f"📦 Dumping {len(self.Sonos.siriusxm_channels)} SiriusXM channels from cache...")
-
-        for idx, ch in enumerate(self.Sonos.siriusxm_channels):
-            cid = ch.get("id", "")
-            num = ch.get("channelNumber", "")
-            name = ch.get("name", "")
-            stream = ch.get("streamUrl", "—")
-            self.logger.debug(f"🔎 [{idx}] id='{cid}' | number='{num}' | name='{name}' | streamUrl='{stream}'")
-
-        self.logger.debug("🧪 Skipping channel match and playback — this is a data dump only.")
-
-
-
-
-#! /usr/bin/env python
-# -*- coding: utf-8 -*-
-#
-
+import subprocess
 
 # imports_successful = True
 
@@ -262,6 +109,8 @@ class Plugin(indigo.PluginBase):
         self.eventsDebug = False
         self.stateUpdatesDebug = False
         self.StopThread = False
+
+
 
 
         # ✅ Instantiate SonosPlugin here
@@ -282,7 +131,6 @@ class Plugin(indigo.PluginBase):
     # plugin.py
     def getSiriusXMChannelList(self, filter="", valuesDict=None, typeId="", targetId=0):
         return self.Sonos.getSiriusXMChannelList(filter, valuesDict, typeId, targetId)
-
 
 
 
@@ -320,6 +168,17 @@ class Plugin(indigo.PluginBase):
 
 
 
+    def menuDumpGroups(self):
+        if not self.Sonos or not hasattr(self.Sonos, "dump_groups_to_log"):
+            self.logger.warning("🚫 Sonos instance or dump method is missing.")
+            return
+
+        self.logger.info("📦 Invoking Sonos → dump_groups_to_log()...")
+        self.Sonos.dump_groups_to_log()
+
+
+
+
     def menuDumpSiriusXMChannels(self):
         if not self.Sonos or not hasattr(self.Sonos, "dump_siriusxm_channels_to_log"):
             self.logger.warning("🚫 Sonos instance or dump method is missing.")
@@ -343,21 +202,29 @@ class Plugin(indigo.PluginBase):
 
     def display_plugin_information(self):
         try:
+            import soco            
+            soco_version = getattr(soco, '__version__', 'unknown')
+            soco_path = getattr(soco, '__file__', 'unknown')
+
             def plugin_information_message():
-                plugin_information_ui = "Plugin Information:\n"
-                plugin_information_ui += f"{'':={'^'}80}\n"
-                plugin_information_ui += f"{'Plugin Name:':<30} {self.globals[PLUGIN_INFO][PLUGIN_DISPLAY_NAME]}\n"
-                plugin_information_ui += f"{'Plugin Version:':<30} {self.globals[PLUGIN_INFO][PLUGIN_VERSION]}\n"
-                plugin_information_ui += f"{'Plugin ID:':<30} {self.globals[PLUGIN_INFO][PLUGIN_ID]}\n"
-                plugin_information_ui += f"{'Indigo Version:':<30} {indigo.server.version}\n"
-                plugin_information_ui += f"{'Indigo License:':<30} {indigo.server.licenseStatus}\n"
-                plugin_information_ui += f"{'Indigo API Version:':<30} {indigo.server.apiVersion}\n"
-                plugin_information_ui += f"{'Architecture:':<30} {platform.machine()}\n"
-                plugin_information_ui += f"{'Python Version:':<30} {sys.version.split(' ')[0]}\n"
-                plugin_information_ui += f"{'Mac OS Version:':<30} {platform.mac_ver()[0]}\n"
-                plugin_information_ui += f"{'Plugin Process ID:':<30} {os.getpid()}\n"
-                plugin_information_ui += f"{'':={'^'}80}\n"
-                return plugin_information_ui
+                lines = []
+                lines.append("Plugin Information:\n")
+                lines.append(f"{'Plugin Name:':<30} {self.globals[PLUGIN_INFO][PLUGIN_DISPLAY_NAME]}")
+                lines.append(f"{'Plugin Version:':<30} {self.globals[PLUGIN_INFO][PLUGIN_VERSION]}")
+                lines.append(f"{'Plugin ID:':<30} {self.globals[PLUGIN_INFO][PLUGIN_ID]}")
+                lines.append(f"{'Indigo Version:':<30} {indigo.server.version}")
+                lines.append(f"{'Indigo License:':<30} {indigo.server.licenseStatus}")
+                lines.append(f"{'Indigo API Version:':<30} {indigo.server.apiVersion}")
+                lines.append(f"{'Architecture:':<30} {platform.machine()}")
+                lines.append(f"{'Python Version:':<30} {sys.version.split(' ')[0]}")
+                lines.append(f"{'Mac OS Version:':<30} {platform.mac_ver()[0]}")
+                lines.append(f"{'Plugin Process ID:':<30} {os.getpid()}")
+                lines.append(f"{'SoCo Version:':<30} {soco_version}")
+                lines.append(f"{'SoCo Path:':<30} {soco_path}")
+
+                max_length = max(len(line) for line in lines[1:])  # Skip header
+                separator = f"{'':={'^'}{max_length}}"
+                return "\n".join([lines[0], separator] + lines[1:] + [separator])
 
             self.logger.info(plugin_information_message())
 
@@ -393,7 +260,6 @@ class Plugin(indigo.PluginBase):
 
 
 
-
     def startup(self):
         try:
             self.logger.info("Plugin startup started.")
@@ -408,7 +274,9 @@ class Plugin(indigo.PluginBase):
             self.logger.warning(f"🧪 Attempting to call deviceStartComm on object of type: {type(self.Sonos)}")
             self.logger.debug(f"🧪 Methods available: {dir(self.Sonos)}")
 
-            self.Sonos.startup()  # ✅ <-- This was commented out
+
+            self.Sonos.startup()  # ✅ <-- This was previously commented out but now active
+            self.display_plugin_information()
 
             self.logger.info("Plugin startup ended.")
 
@@ -859,3 +727,7 @@ class Plugin(indigo.PluginBase):
 
     def getMicrosoftLanguages(self, filter="", valuesDict=None, typeId="", targetId=0):
         return self.Sonos.getMicrosoftLanguages()
+
+
+
+
