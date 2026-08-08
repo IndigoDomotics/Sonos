@@ -387,17 +387,19 @@ class Plugin(indigo.PluginBase):
 
     ######################################################################################
     # ConcurrentThread: Start & Stop
-#    def runConcurrentThread(self):
-#        try:
-#            self.sleep(5.0)  # Delay start of concurrent thread
-#
-#            if self.Sonos is not None:
-#                self.Sonos.runConcurrentThread()
-#            else:
-#                self.StopThread = True
-#
-#        except Exception as exception_error:
-#            self.exception_handler(exception_error, True)  # Log error and display failing statement
+    def runConcurrentThread(self):
+        try:
+            self.sleep(10.0)  # Delay start of concurrent thread
+            while True:
+                # Retry devices that were offline/unreachable when deviceStartComm ran
+                if self.Sonos is not None:
+                    try:
+                        self.Sonos.retry_deferred_devices()
+                    except Exception as exception_error:
+                        self.exception_handler(exception_error, True)
+                self.sleep(60.0)
+        except self.StopThread:
+            pass
 
     def stopConcurrentThread(self):
         try:
@@ -668,13 +670,49 @@ class Plugin(indigo.PluginBase):
 
     def actionTestSiriusXMChannel(self, pluginAction, dev):
         self.logger.info(f"Running testSiriusXMChannel for {dev.name}")
-        self.Sonos.testSiriusXMChannelChange(dev)
+        self.Sonos.menutestSiriusXMChannelChange()
+
+    # Actions.xml callback name for the Test SiriusXM Channel action
+    def testSiriusXMChannel(self, pluginAction, dev):
+        return self.actionTestSiriusXMChannel(pluginAction, dev)
 
     def dumpSiriusXMChannelsToLog(self):
         self.Sonos.dump_siriusxm_channels_to_log()
 
     def DeleteandDefineSiriusXMChannels(self):
         self.Sonos.DeleteandDefine_siriusxm_channels()
+
+    # --- HA-parity soundbar/EQ actions ---
+    def actionSpeechEnhancement(self, pluginAction):
+        return self.Sonos.actionDirect(pluginAction, "SpeechEnhancement")
+
+    def actionAudioDelay(self, pluginAction):
+        return self.Sonos.actionDirect(pluginAction, "AudioDelay")
+
+    def actionSurroundEnable(self, pluginAction):
+        return self.Sonos.actionDirect(pluginAction, "SurroundEnable")
+
+    def actionSurroundLevel(self, pluginAction):
+        return self.Sonos.actionDirect(pluginAction, "SurroundLevel")
+
+    def actionMusicSurroundLevel(self, pluginAction):
+        return self.Sonos.actionDirect(pluginAction, "MusicSurroundLevel")
+
+    def actionMusicFullVolume(self, pluginAction):
+        return self.Sonos.actionDirect(pluginAction, "MusicFullVolume")
+
+    # --- Native Sonos alarm management ---
+    def actionSonosAlarm(self, pluginAction):
+        return self.Sonos.actionSonosAlarm(pluginAction)
+
+    def getSonosAlarmsList(self, filter="", valuesDict=None, typeId="", targetId=0):
+        return self.Sonos.getSonosAlarmsList(filter, valuesDict, typeId, targetId)
+
+    def actionBass(self, pluginAction):
+        return self.Sonos.actionDirect(pluginAction, "Bass")
+
+    def actionTreble(self, pluginAction):
+        return self.Sonos.actionDirect(pluginAction, "Treble")
 
     def actionBassUp(self, pluginAction):
         return self.Sonos.actionDirect(pluginAction, "BassUp")

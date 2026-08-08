@@ -161,6 +161,97 @@
 		<CallbackMethod>actionNightMode</CallbackMethod>
 	</Action>
 
+	<Action id="actionSpeechEnhancement" deviceFilter="self.ZonePlayer" uiPath="Equalizer">
+		<Name>Sonos: Speech Enhancement</Name>
+		<ConfigUI>
+			<Field id="setting" type="checkbox">
+				<Label>Speech Enhancement:</Label>
+			</Field>
+		</ConfigUI>
+		<CallbackMethod>actionSpeechEnhancement</CallbackMethod>
+	</Action>
+
+	<Action id="actionAudioDelay" deviceFilter="self.ZonePlayer" uiPath="Equalizer">
+		<Name>Sonos: Audio Delay (Lip Sync)</Name>
+		<ConfigUI>
+			<Field id="setting" type="menu" defaultValue="0">
+				<Label>Audio Delay:</Label>
+				<List>
+					<Option value="0">0 (off)</Option>
+					<Option value="1">1</Option>
+					<Option value="2">2</Option>
+					<Option value="3">3</Option>
+					<Option value="4">4</Option>
+					<Option value="5">5 (max)</Option>
+				</List>
+			</Field>
+		</ConfigUI>
+		<CallbackMethod>actionAudioDelay</CallbackMethod>
+	</Action>
+
+	<Action id="actionSurroundEnable" deviceFilter="self.ZonePlayer" uiPath="Equalizer">
+		<Name>Sonos: Surround Speakers On/Off</Name>
+		<ConfigUI>
+			<Field id="setting" type="checkbox">
+				<Label>Surround Speakers Enabled:</Label>
+			</Field>
+		</ConfigUI>
+		<CallbackMethod>actionSurroundEnable</CallbackMethod>
+	</Action>
+
+	<Action id="actionSurroundLevel" deviceFilter="self.ZonePlayer" uiPath="Equalizer">
+		<Name>Sonos: Surround Level (TV)</Name>
+		<ConfigUI>
+			<Field id="setting" type="textfield">
+				<Label>Surround Level (-15 to 15):</Label>
+			</Field>
+		</ConfigUI>
+		<CallbackMethod>actionSurroundLevel</CallbackMethod>
+	</Action>
+
+	<Action id="actionMusicSurroundLevel" deviceFilter="self.ZonePlayer" uiPath="Equalizer">
+		<Name>Sonos: Surround Level (Music)</Name>
+		<ConfigUI>
+			<Field id="setting" type="textfield">
+				<Label>Music Surround Level (-15 to 15):</Label>
+			</Field>
+		</ConfigUI>
+		<CallbackMethod>actionMusicSurroundLevel</CallbackMethod>
+	</Action>
+
+	<Action id="actionMusicFullVolume" deviceFilter="self.ZonePlayer" uiPath="Equalizer">
+		<Name>Sonos: Music Playback Full Volume (Surrounds)</Name>
+		<ConfigUI>
+			<Field id="setting" type="checkbox">
+				<Label>Full Volume Music on Surrounds:</Label>
+			</Field>
+		</ConfigUI>
+		<CallbackMethod>actionMusicFullVolume</CallbackMethod>
+	</Action>
+
+	<Action id="sep13C" uiPath="Alarms"/>
+	<Action id="actionSonosAlarm" uiPath="Alarms">
+		<Name>Sonos: Set Alarm On/Off</Name>
+		<ConfigUI>
+			<Field id="alarmId" type="menu">
+				<Label>Sonos Alarm:</Label>
+				<List class="self" method="getSonosAlarmsList" dynamicReload="yes"/>
+			</Field>
+			<Field id="operation" type="menu" defaultValue="toggle">
+				<Label>Operation:</Label>
+				<List>
+					<Option value="enable">Enable</Option>
+					<Option value="disable">Disable</Option>
+					<Option value="toggle">Toggle</Option>
+				</List>
+			</Field>
+			<Field id="volume" type="textfield">
+				<Label>Alarm Volume 0-100 (optional, blank = unchanged):</Label>
+			</Field>
+		</ConfigUI>
+		<CallbackMethod>actionSonosAlarm</CallbackMethod>
+	</Action>
+
 	<Action id="actionQ_Crossfade" deviceFilter="self.ZonePlayer" uiPath="Queue Toggles">
 		<Name>Sonos: Queue Crossfade</Name>
 		<ConfigUI>
@@ -848,27 +939,10 @@
 		<Name>Sonos: Dump URI</Name>
 		<CallbackMethod>actionZP_DumpURI</CallbackMethod>
 	</Action>
-	<ActionType id="actionTogglePlay" uiPath="Sonos Controls" allowPluginToProcess="true">
-    <Name>Toggle Play/Pause</Name>
-    <Description>Toggle playback state (Play/Pause) on a Sonos device</Description>
-    <ConfigUI>
-        <DeviceList id="deviceId" filter="com.indigodomo.plugin.Sonos" label="Target Sonos Device" />
-    </ConfigUI>
-
-
-
-
-</ActionType>
-
-
-
-<Action type="testSiriusXMChannel" id="testSiriusXMChannel" deviceTypeId="sonosDevice">
-    <Name>Test SiriusXM Channel</Name>
-    <CallbackMethod>testSiriusXMChannel</CallbackMethod>
-    <ConfigUI>
-        <!-- no inputs needed -->
-    </ConfigUI>
-</Action>
+	<Action id="testSiriusXMChannel" deviceFilter="self.ZonePlayer" uiPath="Music Source">
+		<Name>Test SiriusXM Channel</Name>
+		<CallbackMethod>testSiriusXMChannel</CallbackMethod>
+	</Action>
 
 
 

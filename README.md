@@ -1,16 +1,124 @@
-# Sonos
-This version (1.0.2):
-1. Updated soco library to - 0.30.9 for better control function support and overall stability.
-2. Rewrote and fixed subscription services, includes fallback subscription upon failure to address devices falling of network.
-3. Added menu option for dumping subscribed devices to the log as diagnostic aid on subscripition failures.
-4. Rewrote discover to facilitate VLAN access for dedicated SONOS VLAN network access and control.
-5. Rewrote and corrected volume controls.
-6. Rewrote and corrected Bass and Treble controls.
-7. Implemented SiriusXM login and channel processing.
-8. Added menu options for dumping registered available XM Channel list to the log.
-9. Rewrote and corrected Pandora loging / crypto processing from python 2 to python 3 based calls.
-10. Implemented Pandora login and channel processing.
-11. Added additional modules to requirements.txt.
-12. Added Artwork / Metadata server.
-13. Added menu option for dumping group device inventory / master controller identification to the log (matrixed Sonos SOCO Name / IP ADDRESS / Indigo Name / Indigo Device ID) for device management insight clarification.
-14. Updated group controls to copy master controller enriched metadata states to all associated devices in the current device grouping.
+# Sonos Plugin for Indigo
+
+Control your entire Sonos system from [Indigo](https://www.indigodomo.com) — playback, volume, grouping, favourites, streaming services, announcements, soundbar tuning, and native Sonos alarms — as first-class Indigo devices, actions, and triggers.
+
+**Current version: 2025.2.3** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
+
+---
+
+## Highlights of 2025.2.3
+
+This release is a major reliability and completeness overhaul, addressing the failure cascade reported in [IndigoDomotics/Sonos#16](https://github.com/IndigoDomotics/Sonos/issues/16) and restoring a number of actions that had silently stopped working.
+
+### Rock-solid with offline players and flaky networks
+
+Previously, a single unplugged speaker could freeze the whole plugin — minutes-long startups, a config dialog that would not open, reloads needing a force-kill, and log storms hammering healthy players. All of that is fixed:
+
+- **Fast reachability probes everywhere** — an offline player is detected in ~1 second, marked with an `offline` device state in Indigo, and skipped (with a 30-second back-off) instead of blocking the plugin in serial 10–20 s network timeouts.
+- **Automatic recovery** — offline players are re-checked in the background every 60 seconds and come back to life on their own when the network returns. No plugin restart needed.
+- **Every network call is time-bounded** — no more unbounded HTTP requests anywhere on the hot path (SoCo's global request timeout is also capped at 5 s).
+- **Clean, fast plugin stop/reload** — unsubscribing from an offline player no longer blocks shutdown, so reloads complete without Indigo force-killing the process.
+- **Announcement storm fix** — group announcements no longer trigger a flood of topology fetches against every player for every zone change (debounced + probe-gated), which previously could knock healthy WiFi speakers off the network mid-announcement.
+- **Player UIDs resolve instantly from cached Indigo state** — no repeated `DeviceProperties` fetches against dead players.
+
+### Full support for routed / VLAN'd Sonos networks
+
+If your players live on a dedicated subnet (e.g. Sonos on `192.168.30.0/24`, Indigo Mac on `192.168.1.0/24`):
+
+- Interface selection now falls back to the **OS routing table** when no local interface sits directly on the Sonos subnet — announcements and event subscriptions work across the router instead of failing with *"No interface found on target Sonos subnet"*.
+- All player communication is **direct-by-IP**; multicast discovery (which cannot cross a router) is never required and no longer spams warnings when it finds nothing.
+
+### Previously broken actions — now working
+
+An automated end-to-end audit (Actions.xml → plugin.py → handler) found **10 actions that were offered in the UI but did nothing** (logging *"Unknown or unsupported action"*) or crashed. All are restored and verified:
+
+| Action | Status |
+|---|---|
+| Play RadioTime Favourite Station | Restored (was breaking alarm/announcement action groups) |
+| Bass / Treble (set to level) | Restored — no handler existed at all |
+| Night Mode | Restored |
+| Play Queue | Restored |
+| Sleep Timer | Restored |
+| TV Input (soundbars) | Restored |
+| Dump URI (diagnostics) | Restored |
+| Pandora Thumbs Up / Thumbs Down | Restored — handler method was missing |
+| Test SiriusXM Channel | Fixed malformed action definition + missing callback |
+| Line-In | Fixed in 2025.2.1 ([#15](https://github.com/IndigoDomotics/Sonos/pull/15)) |
+
+Also fixed in this area:
+
+- **Sonos Favourites playback** — a Python‑2 remnant (`urllib.unquote`) crashed favourites; fixed. Favourite routing also corrected: `x-sonosapi-hls:` is a *generic* HLS scheme (Sonos Radio HD, Apple Music radio, …) and is no longer misrouted to the SiriusXM handler — only URIs carrying `channel-linear:<guid>` are SiriusXM. Generic HLS/HTTP favourites now play via their stored URI + metadata.
+- **SiriusXM from favourites** — the handler now accepts the channel GUID embedded in a favourite's URI, not just the action's channel dropdown.
+- Two latent dispatch-signature crashes (`ZP_SiriusXM` missing `props`, `Q_Crossfade` arity) fixed.
+- Stale device state lists (the *"state key Grouped not defined"* error spam) are resynced automatically from Devices.xml on startup.
+
+### New features (Home Assistant parity)
+
+Feature set cross-checked against Home Assistant's Sonos integration; the following were added using the same SoCo/UPnP semantics:
+
+**Equalizer / soundbar controls** (Actions → Sonos → Equalizer):
+
+- **Speech Enhancement** on/off (Arc, Beam, Playbar dialog clarity)
+- **Audio Delay (Lip Sync)** 0–5
+- **Surround Speakers** on/off
+- **Surround Level (TV)** −15…15
+- **Surround Level (Music)** −15…15
+- **Music Playback Full Volume** — full-volume vs ambient music on surrounds
+
+**Native Sonos alarm management** (Actions → Sonos → Alarms):
+
+- **Set Alarm On/Off** — lists your household's Sonos alarms live (`07:00 — Master Bedroom — DAILY — enabled`), with Enable / Disable / Toggle and an optional volume override. Perfect for "disable the wake-up alarm on public holidays" style automations.
+
+---
+
+## Installation
+
+1. Download the latest release and double-click `Sonos.indigoPlugin` — Indigo installs and enables it.
+2. Open **Plugins → Sonos → Configure…**:
+   - **Reference ZonePlayer IP** — any player's IP, or `auto`. Used to load favourites/playlists/stations.
+   - **Sonos Target Subnet** — the subnet your players live on (e.g. `192.168.30.0/24`). If your Mac isn't directly on that subnet, the plugin automatically uses the routed interface — you don't need to change anything.
+   - Announcement/streaming host + port, event processor settings, and optional Pandora / SiriusXM credentials.
+3. Create one Indigo device (type **Sonos ZonePlayer**) per player, entering each player's IP address. Use fixed IPs / DHCP reservations for your players.
+
+Players that are offline when the plugin starts show an `offline` device state and are picked up automatically when they reappear.
+
+## Devices & States
+
+Each ZonePlayer device exposes rich states usable in triggers and control pages, including transport state, track metadata + album art, volume/mute/bass/treble, grouping (`Grouped`, `GROUP_Coordinator`, `GROUP_Name`, `ZonePlayerUUIDsInGroup`), queue flags (repeat/shuffle/crossfade), and identity (`ZP_LocalUID`, model, serial).
+
+Grouped players mirror the coordinator's enriched metadata states, so a control page bound to any group member shows what's actually playing.
+
+## Actions overview
+
+- **Transport**: Play, Pause, Toggle Play/Pause, Stop, Next, Previous, Channel Up/Down
+- **Volume**: set/up/down, mute on/off/toggle — per player and per group, plus relative group volume
+- **Equalizer**: Bass, Treble (set or step), Loudness via player, Night Mode, Speech Enhancement, Audio Delay, Surround on/off + levels, Music Full Volume
+- **Music sources**: Sonos Favourites, Sonos Playlists, RadioTime Favourite Stations, Sonos Radio, Pandora (+ Thumbs Up/Down), SiriusXM (+ channel list, test), Spotify/containers, Line-In, TV input, Play Queue
+- **Queue**: Clear, Save, Crossfade, Repeat / Repeat One / Toggle, Shuffle / Toggle
+- **Grouping**: Add player(s) to zone, Set standalone (one/all), with group-state resync
+- **Announcements**: file/MP3 announcements over the built-in HTTP server, with automatic ungroup → announce → regroup and state save/restore; Amazon Polly TTS supported
+- **Alarms**: enable/disable/toggle native Sonos alarms, optional volume override
+- **Utilities**: Save/Restore player states, Dump URI, group/topology diagnostic dumps (menu items)
+
+## Troubleshooting
+
+- **A player shows `offline`** — the plugin probes it every 60 s and will restore it automatically once reachable. Nothing to do.
+- **Config dialog, favourites lists, or actions feel slow** — check the log for a player timing out; one unreachable IP no longer blocks the plugin, but fixing the network (or deleting a decommissioned player's device) keeps logs clean.
+- **Favourite won't play** — check the log: unknown favourite types are logged with their URI. Open an issue including that line.
+- **Menu → dump options** — group topology, subscribed devices, and SiriusXM channel dumps are available as diagnostic aids under the plugin menu.
+
+## Version history
+
+**2025.2.3** — Offline-player resilience (probe gating, UID caching, bounded timeouts, clean shutdown), routed-VLAN support, announcement topology-storm fix, state-list resync, 10 restored actions, favourites routing fixes, new Equalizer/soundbar actions, native Sonos alarm management. See [PR #17](https://github.com/IndigoDomotics/Sonos/pull/17).
+
+**2025.2.1** — Line-In action fix ([#15](https://github.com/IndigoDomotics/Sonos/pull/15)); HTTPStreamer port leak and Polly prefs fixes ([#14](https://github.com/IndigoDomotics/Sonos/pull/14)); dynamic install-path resolution ([#13](https://github.com/IndigoDomotics/Sonos/pull/13)).
+
+**1.0.2** — SoCo 0.30.9 upgrade; rewritten subscriptions with fallback; VLAN-aware discovery; corrected volume/bass/treble controls; SiriusXM login + channel processing; Pandora auth ported to Python 3; artwork/metadata server; group metadata mirroring; diagnostic menu dumps.
+
+## Credits
+
+Originally by Vic Solomon; Python 3 port and ongoing maintenance by the Indigo community (IndigoDomotics), with contributions from forum users and plugin contributors. Uses the [SoCo](https://github.com/SoCo/SoCo) library. Not affiliated with Sonos, Inc.
+
+## License
+
+See [LICENSE](LICENSE).

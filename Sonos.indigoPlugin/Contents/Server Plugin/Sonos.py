@@ -315,6 +315,12 @@ class SonosPlugin(object):
         self.ip_to_indigo_device = {}
         self.uuid_to_soco = {}
         self.zone_group_state_cache = {}  # ✅ ensure this exists early
+        # Cap SoCo's default 20s per-request timeout — one offline player must not
+        # be able to stall dispatch-thread work for 20s at a time.
+        # NOTE: 'soco' is shadowed by a local variable later in __init__, so alias
+        # the module explicitly here.
+        import soco.config as _soco_config
+        _soco_config.REQUEST_TIMEOUT = 5.0
 
         # HTTP bits
         self.httpd = None
@@ -438,10 +444,11 @@ class SonosPlugin(object):
             group_name = dev.states.get("GROUP_Name") or self.group_name_by_device_id.get(dev.id, "?")
             #self.logger.warning(f"⚠️ I set Group_Name early on to initialize for Londonmark script: Name= '{group_name}' Address= '{dev.address}'")            
             if soco:
-                try:
-                    self.uuid_to_indigo_device[soco.uid] = dev
-                except Exception as e:
-                    self.logger.warning(f"⚠️ Could not map UUID for device '{dev.name}': {e}")
+                uid = self.safe_uid(dev.address, soco)  # probe-gated; no repeated timeouts on offline players
+                if uid:
+                    self.uuid_to_indigo_device[uid] = dev
+                else:
+                    self.logger.debug(f"UUID for '{dev.name}' not yet resolvable (player offline?) — will map later")
 
 
 
@@ -546,13 +553,13 @@ class SonosPlugin(object):
             # Dispatch handler mapping (global or device-aware)
             dispatch_table = {
                 "SetSiriusXMChannel":        lambda p, d, z: self.handleAction_SetSiriusXMChannel(p, d, z),
-                "actionZP_SiriusXM":         lambda p, d, z: self.handleAction_ZP_SiriusXM(p, d, z),
+                "actionZP_SiriusXM":         lambda p, d, z: self.handleAction_ZP_SiriusXM(p, d, z, p.props),
                 "actionZP_Pandora":          lambda p, d, z: self.handleAction_ZP_Pandora(p, d, z, p.props),
                 "actionChannelUp":           lambda p, d, z: self.handleAction_ChannelUp(p, d, z),
                 "actionChannelDown":         lambda p, d, z: self.handleAction_ChannelDown(p, d, z),
                 "actionZP_addPlayerToZone":  lambda p, d, z: self.handleAction_ZP_addPlayerToZone(p, d, z),
                 "actionQ_Shuffle":           lambda p, d, z: self.handleAction_Q_Shuffle(p, d, z),
-                "actionQ_Crossfade":         lambda p, d, z: self.handleAction_Q_Crossfade(p, d, z),
+                "actionQ_Crossfade":         lambda p, d, z: self.handleAction_Q_Crossfade(p, d),
             }
 
             device_id = int(pluginAction.deviceId)
@@ -1124,8 +1131,7 @@ class SonosPlugin(object):
                         break
                 mode = pluginAction.props.get("mode")
                 if mode == "":
-                    mode = "Play Now"
-                    return
+                    mode = "Play Now"  # (a stray `return` here used to abort the action when mode was empty)
                 if uri_radio in l2p:
                     self.actionDirect (PA(dev.id, {"setting":l2p}), "ZP_RT_FavStation")
                     return
@@ -1133,10 +1139,17 @@ class SonosPlugin(object):
                     setting = l2p[l2p.find(":")+1:l2p.find("?")]
                     self.actionDirect (PA(dev.id, {"setting":setting}), "ZP_Pandora")
                     return
-                elif uri_siriusxm in l2p:
-                    #setting = l2p[l2p.find("%3a")+3:l2p.find("?")]
-                    setting = urllib.unquote(l2p[l2p.find(":")+1:l2p.find("?")])
+                elif uri_siriusxm in l2p and "channel-linear" in l2p:
+                    # True SiriusXM favourites carry channel-linear:<guid>. Plain
+                    # x-sonosapi-hls: is a generic HLS scheme (Sonos Radio HD, Apple
+                    # Music radio, …) and must NOT be routed to the SiriusXM handler.
+                    setting = urllib.parse.unquote(l2p[l2p.find(":")+1:l2p.find("?")])
                     self.actionDirect (PA(dev.id, {"setting":setting}), "ZP_SiriusXM")
+                    return
+                elif uri_siriusxm in l2p or uri_sonos_http in l2p:
+                    # Generic streaming favourite — play it with its stored URI and
+                    # DIDL metadata via the Sonos Radio path.
+                    self.actionDirect (PA(dev.id, {"setting":l2p}), "ZP_SonosRadio")
                     return
                 elif uri_spotify in l2p:
                     self.actionDirect (PA(dev.id, {"setting":l2p, "mode":mode}), "ZP_Container")
@@ -1164,6 +1177,22 @@ class SonosPlugin(object):
                 self.SOAPSend (zoneIP, "/MediaRenderer", "/AVTransport", "SetAVTransportURI", "<CurrentURI>"+URI+"</CurrentURI><CurrentURIMetaData>"+MD+"</CurrentURIMetaData>")
                 self.SOAPSend (zoneIP, "/MediaRenderer", "/AVTransport", "Play", "<Speed>1</Speed>")
                 indigo.server.log ("ZonePlayer: %s, Play Radio: %s" % (dev.name, pTitle))
+                return
+
+            elif action_id == "ZP_RT_FavStation":
+                # Restored from the original plugin — this branch was lost in a refactor,
+                # leaving the "Play RadioTime Favorite Station" action (and radio-URI
+                # favorites forwarded from ZP_SonosFavorites) logging
+                # "Unknown or unsupported action: ZP_RT_FavStation" and doing nothing.
+                if dev.states["GROUP_Coordinator"] == "false":
+                    zoneIP = coordinator_dev.pluginProps.get("address", "").strip()
+                if zoneIP:
+                    l2p = pluginAction.props.get("setting", "").replace("&", "&amp;")
+                    self.SOAPSend (zoneIP, "/MediaRenderer", "/AVTransport", "SetAVTransportURI", "<CurrentURI>"+l2p+"</CurrentURI><CurrentURIMetaData>&lt;DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" xmlns:r=\"urn:schemas-rinconnetworks-com:metadata-1-0/\" xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\"&gt;&lt;item id=\"-1\" parentID=\"-1\" restricted=\"true\"&gt;&lt;dc:title&gt;RADIO&lt;/dc:title&gt;&lt;upnp:class&gt;object.item.audioItem.audioBroadcast&lt;/upnp:class&gt;&lt;desc id=\"cdudn\" nameSpace=\"urn:schemas-rinconnetworks-com:metadata-1-0/\"&gt;SA_RINCON65031_&lt;/desc&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;</CurrentURIMetaData>")
+                    self.SOAPSend (zoneIP, "/MediaRenderer", "/AVTransport", "Play", "<Speed>1</Speed>")
+                    indigo.server.log ("ZonePlayer: %s, Play RadioTime Station" % dev.name)
+                else:
+                    self.logger.warning(f"ZonePlayer: {dev.name}, 'ZP RT FavStation' not actioned as Zone IP cannot be resolved!")
                 return
 
             elif action_id == "ZP_Container":
@@ -1531,6 +1560,144 @@ class SonosPlugin(object):
 
             elif action_id == "ZP_LIST":
                 self.actionZP_LIST(pluginAction, dev)
+                return
+
+            ############################################################################################
+            # Restored action branches — these actions were offered in Actions.xml but their
+            # handlers were lost in a refactor, so they all fell through to "Unknown or
+            # unsupported action". Semantics follow the original implementation, which matches
+            # SoCo / Home Assistant's Sonos integration (SetBass/SetTreble clamp to ±10,
+            # night mode via RenderingControl SetEQ, sleep timer via ConfigureSleepTimer,
+            # queue via x-rincon-queue, TV input via x-sonos-htastream spdif).
+            ############################################################################################
+
+            elif action_id in ("actionBass", "Bass"):
+                setting = pluginAction.props.get("setting")
+                try:
+                    new_bass = max(-10, min(10, int(setting)))
+                except (TypeError, ValueError):
+                    self.logger.error(f"❌ Invalid bass value '{setting}' for {dev.name} (expected -10..10)")
+                    return
+                current_bass = dev.states.get("ZP_BASS", "0")
+                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetBass", f"<DesiredBass>{new_bass}</DesiredBass>")
+                self.logger.info(f"ZonePlayer: {dev.name}, Current Bass: {current_bass}, New Bass: {new_bass}")
+                return
+
+            elif action_id in ("actionTreble", "Treble"):
+                setting = pluginAction.props.get("setting")
+                try:
+                    new_treble = max(-10, min(10, int(setting)))
+                except (TypeError, ValueError):
+                    self.logger.error(f"❌ Invalid treble value '{setting}' for {dev.name} (expected -10..10)")
+                    return
+                current_treble = dev.states.get("ZP_TREBLE", "0")
+                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetTreble", f"<DesiredTreble>{new_treble}</DesiredTreble>")
+                self.logger.info(f"ZonePlayer: {dev.name}, Current Treble: {current_treble}, New Treble: {new_treble}")
+                return
+
+            elif action_id in ("actionNightMode", "NightMode"):
+                setting = pluginAction.props.get("setting")
+                mode = 1 if setting in (True, "true", "True", 1, "1", "on") else 0
+                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>NightMode</EQType><DesiredValue>{mode}</DesiredValue>")
+                self.logger.info(f"ZonePlayer: {dev.name}, Night Mode: {bool(mode)}")
+                return
+
+            # --- HA-parity soundbar/EQ controls (RenderingControl SetEQ, same EQ types SoCo uses) ---
+
+            elif action_id in ("actionSpeechEnhancement", "SpeechEnhancement"):
+                setting = pluginAction.props.get("setting")
+                mode = 1 if setting in (True, "true", "True", 1, "1", "on") else 0
+                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>DialogLevel</EQType><DesiredValue>{mode}</DesiredValue>")
+                self.logger.info(f"ZonePlayer: {dev.name}, Speech Enhancement: {bool(mode)}")
+                return
+
+            elif action_id in ("actionAudioDelay", "AudioDelay"):
+                setting = pluginAction.props.get("setting")
+                try:
+                    delay = max(0, min(5, int(setting)))
+                except (TypeError, ValueError):
+                    self.logger.error(f"❌ Invalid audio delay '{setting}' for {dev.name} (expected 0..5)")
+                    return
+                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>AudioDelay</EQType><DesiredValue>{delay}</DesiredValue>")
+                self.logger.info(f"ZonePlayer: {dev.name}, Audio Delay: {delay}")
+                return
+
+            elif action_id in ("actionSurroundEnable", "SurroundEnable"):
+                setting = pluginAction.props.get("setting")
+                mode = 1 if setting in (True, "true", "True", 1, "1", "on") else 0
+                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>SurroundEnable</EQType><DesiredValue>{mode}</DesiredValue>")
+                self.logger.info(f"ZonePlayer: {dev.name}, Surround Speakers: {'enabled' if mode else 'disabled'}")
+                return
+
+            elif action_id in ("actionSurroundLevel", "SurroundLevel"):
+                setting = pluginAction.props.get("setting")
+                try:
+                    level = max(-15, min(15, int(setting)))
+                except (TypeError, ValueError):
+                    self.logger.error(f"❌ Invalid surround level '{setting}' for {dev.name} (expected -15..15)")
+                    return
+                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>SurroundLevel</EQType><DesiredValue>{level}</DesiredValue>")
+                self.logger.info(f"ZonePlayer: {dev.name}, Surround Level (TV): {level}")
+                return
+
+            elif action_id in ("actionMusicSurroundLevel", "MusicSurroundLevel"):
+                setting = pluginAction.props.get("setting")
+                try:
+                    level = max(-15, min(15, int(setting)))
+                except (TypeError, ValueError):
+                    self.logger.error(f"❌ Invalid music surround level '{setting}' for {dev.name} (expected -15..15)")
+                    return
+                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>MusicSurroundLevel</EQType><DesiredValue>{level}</DesiredValue>")
+                self.logger.info(f"ZonePlayer: {dev.name}, Surround Level (Music): {level}")
+                return
+
+            elif action_id in ("actionMusicFullVolume", "MusicFullVolume"):
+                setting = pluginAction.props.get("setting")
+                mode = 1 if setting in (True, "true", "True", 1, "1", "on") else 0  # 1 = full volume, 0 = ambient
+                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>SurroundMode</EQType><DesiredValue>{mode}</DesiredValue>")
+                self.logger.info(f"ZonePlayer: {dev.name}, Music on Surrounds: {'full volume' if mode else 'ambient'}")
+                return
+
+            elif action_id in ("actionZP_Queue", "ZP_Queue"):
+                if dev.states["GROUP_Coordinator"] == "false":
+                    zoneIP = coordinator_dev.pluginProps.get("address", "").strip()
+                    dev_src_LocalUID = coordinator_dev.states['ZP_LocalUID']
+                else:
+                    dev_src_LocalUID = dev.states['ZP_LocalUID']
+                if zoneIP and dev_src_LocalUID:
+                    self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "SetAVTransportURI", f"<CurrentURI>x-rincon-queue:{dev_src_LocalUID}#0</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+                    self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Play", "<Speed>1</Speed>")
+                    indigo.server.log("ZonePlayer: %s, Play Queue" % dev.name)
+                else:
+                    self.logger.warning(f"ZonePlayer: {dev.name}, 'ZP Queue' not actioned as Zone IP cannot be resolved!")
+                return
+
+            elif action_id in ("actionZP_sleepTimer", "ZP_sleepTimer"):
+                if dev.states["GROUP_Coordinator"] == "false":
+                    zoneIP = coordinator_dev.pluginProps.get("address", "").strip()
+                if zoneIP:
+                    duration = pluginAction.props.get("setting", "")
+                    self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "ConfigureSleepTimer", f"<NewSleepTimerDuration>{duration}</NewSleepTimerDuration>")
+                    self.logger.info(f"ZonePlayer: {dev.name}, Sleep Timer set to: {duration or 'off'}")
+                else:
+                    self.logger.warning(f"ZonePlayer: {dev.name}, 'ZP Sleep Timer' not actioned as Zone IP cannot be resolved!")
+                return
+
+            elif action_id in ("actionZP_TV", "ZP_TV"):
+                local_uid = str(dev.states.get('ZP_LocalUID', '')).strip()
+                if not local_uid:
+                    self.logger.error(f"❌ {dev.name} has no ZP_LocalUID; cannot switch to TV input.")
+                    return
+                self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "SetAVTransportURI", "<CurrentURI>x-sonos-htastream:"+local_uid+":spdif</CurrentURI><CurrentURIMetaData>&lt;DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" xmlns:r=\"urn:schemas-rinconnetworks-com:metadata-1-0/\" xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\"&gt;&lt;item id=\"spdif-input\" parentID=\"0\" restricted=\"false\"&gt;&lt;dc:title&gt;"+local_uid+"&lt;/dc:title&gt;&lt;upnp:class&gt;object.item.audioItem.audioItem&lt;/upnp:class&gt;&lt;res protocolInfo=\"spdif\"&gt;x-sonos-htastream:"+local_uid+":spdif&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;</CurrentURIMetaData>")
+                self.logger.info(f"📺 {dev.name}: switched to TV input")
+                return
+
+            elif action_id in ("actionZP_DumpURI", "ZP_DumpURI"):
+                MediaInfo = self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "GetMediaInfo", "")
+                PositionInfo = self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "GetPositionInfo", "")
+                self.logger.info(f"ZonePlayer: {zoneIP}, {dev.name}")
+                self.logger.info(f"MediaInfo: {MediaInfo}")
+                self.logger.info(f"PositionInfo: {PositionInfo}")
                 return
 
             # If it gets this far, action was not handled
@@ -1951,6 +2118,14 @@ class SonosPlugin(object):
         try:
             guid = pluginAction.props.get("channelSelector")
             if not guid:
+                # Forwarded from a Sonos Favorite: props carry the URI fragment in
+                # "setting" (e.g. "channel-linear:<guid>") rather than a channelSelector.
+                setting = pluginAction.props.get("setting", "") or ""
+                m = re.search(r'channel-linear[:%3a]+([0-9a-fA-F\-]{16,})', setting, re.IGNORECASE)
+                if m:
+                    guid = m.group(1)
+                    self.logger.debug(f"📻 Resolved SiriusXM GUID {guid} from favorite URI fragment")
+            if not guid:
                 self.logger.warning(f"⚠️ No SiriusXM GUID provided for device ID {dev.id}")
                 return
 
@@ -1967,7 +2142,7 @@ class SonosPlugin(object):
 
             self.logger.info(f"📻 Sending {dev.name} to SiriusXM: {title} ({guid})")
 
-            soco_dev = self.soco_by_ip.get(zoneIP)
+            soco_dev = self.get_soco_device(zoneIP)  # cache first, direct SoCo(ip) fallback
             if not soco_dev:
                 self.logger.warning(f"⚠️ soco_device is None for zoneIP {zoneIP}")
                 return
@@ -3339,7 +3514,7 @@ class SonosPlugin(object):
                 live_grouped = False
                 live_group_name = dev.name
 
-                if soco:
+                if soco and self._ip_probe_ok(ip):  # offline player: is_coordinator/.group would block in network timeouts
                     # coordinator truth
                     try:
                         live_coord = bool(getattr(soco, "is_coordinator", False))
@@ -3480,7 +3655,7 @@ class SonosPlugin(object):
                 live_grouped = False
                 live_group_name = dev.name
 
-                if soco:
+                if soco and self._ip_probe_ok(ip):  # offline player: is_coordinator/.group would block in network timeouts
                     # coordinator truth
                     try:
                         live_coord = bool(getattr(soco, "is_coordinator", False))
@@ -3640,7 +3815,17 @@ class SonosPlugin(object):
                     self._set_group_states(coord_dev, grouped=grouped_eval, is_coord=True, group_name=group_name)
                     touched.add(coord_dev.id)
                 else:
-                    self.logger.warning(f"[group] ⚠️ coord_dev missing for coord_ip={coord_ip}")
+                    # A Sonos player with no matching Indigo device (e.g. never added) is
+                    # normal — warn once per IP instead of on every topology evaluation.
+                    if not hasattr(self, "_warned_unmapped_coord_ips"):
+                        self._warned_unmapped_coord_ips = set()
+                    if coord_ip not in self._warned_unmapped_coord_ips:
+                        self._warned_unmapped_coord_ips.add(coord_ip)
+                        self.logger.warning(
+                            f"[group] ⚠️ coord_dev missing for coord_ip={coord_ip} — no Indigo device "
+                            f"maps to this player (further occurrences logged at debug level)")
+                    else:
+                        self.logger.debug(f"[group] coord_dev missing for coord_ip={coord_ip}")
 
                 # members (including bonded) mirror grouped/name; only coord has is_coord=true
                 for m in members:
@@ -4276,6 +4461,8 @@ class SonosPlugin(object):
         # ─────────────────────────────────────────────────────────────────────────────
         for loop_ip, soco in self.soco_by_ip.items():
             try:
+                if not self._ip_probe_ok(loop_ip):
+                    continue  # offline player — .group would block in a network timeout
                 group = soco.group
                 if not group or not group.coordinator:
                     continue
@@ -4308,6 +4495,8 @@ class SonosPlugin(object):
 
         for loop_ip, soco in self.soco_by_ip.items():
             try:
+                if not self._ip_probe_ok(loop_ip):
+                    continue  # offline player — .group would block in a network timeout
                 group = soco.group
                 if not group or not group.coordinator:
                     continue
@@ -6059,7 +6248,7 @@ class SonosPlugin(object):
                         self.getRT_FavStationsDirect()
                         # Retrieve Sonos Device ID for Music API
                         url = "http://" + self.rootZPIP + ":1400/status/zp"
-                        response = requests.get(url)
+                        response = requests.get(url, timeout=5)
                         if response.ok:
                             root = ET.fromstring(response.content)
                             self.SonosDeviceID = root.findtext('.//SerialNumber')
@@ -6328,6 +6517,145 @@ class SonosPlugin(object):
         except Exception as e:
             self.logger.error(f"❌ actionPrevious error for {indigo_device.name}: {e}")
 
+    def _get_any_reachable_soco(self):
+        """Return a SoCo instance for any currently-reachable player, or None."""
+        for ip, sd in list((getattr(self, "soco_by_ip", {}) or {}).items()):
+            if self.is_host_reachable(ip, timeout=1.0):
+                return sd
+        # Fall back to configured Indigo device addresses
+        for idev in indigo.devices.iter("self.ZonePlayer"):
+            ip = (idev.pluginProps.get("address") or idev.address or "").strip()
+            if ip and self.is_host_reachable(ip, timeout=1.0):
+                return self.get_soco_device(ip)
+        return None
+
+    def getSonosAlarmsList(self, filter="", valuesDict=None, typeId="", targetId=0):
+        """Dynamic list of native Sonos alarms for the Set Alarm On/Off action."""
+        try:
+            from soco.alarms import get_alarms
+            soco_dev = self._get_any_reachable_soco()
+            if soco_dev is None:
+                return [("none", "No reachable Sonos player found")]
+            alarms = get_alarms(soco_dev)
+            entries = []
+            for a in sorted(alarms, key=lambda x: str(x.start_time)):
+                zone_name = getattr(getattr(a, "zone", None), "player_name", "?")
+                recurrence = getattr(a, "recurrence", "") or "once"
+                state = "enabled" if a.enabled else "disabled"
+                entries.append((str(a.alarm_id), f"{a.start_time} — {zone_name} — {recurrence} — {state}"))
+            return entries or [("none", "No Sonos alarms configured")]
+        except Exception as e:
+            self.logger.error(f"❌ getSonosAlarmsList failed: {e}")
+            return [("none", "Error loading alarms — see log")]
+
+    def actionSonosAlarm(self, pluginAction):
+        """Enable / disable / toggle a native Sonos alarm (HA-parity feature)."""
+        try:
+            from soco.alarms import get_alarms
+            alarm_id = pluginAction.props.get("alarmId")
+            operation = pluginAction.props.get("operation", "toggle")
+            volume_raw = (pluginAction.props.get("volume") or "").strip()
+
+            if not alarm_id or alarm_id == "none":
+                self.logger.warning("⚠️ No Sonos alarm selected in action config.")
+                return
+
+            soco_dev = self._get_any_reachable_soco()
+            if soco_dev is None:
+                self.logger.error("❌ No reachable Sonos player — cannot modify alarms.")
+                return
+
+            alarm = next((a for a in get_alarms(soco_dev) if str(a.alarm_id) == str(alarm_id)), None)
+            if alarm is None:
+                self.logger.error(f"❌ Sonos alarm '{alarm_id}' no longer exists — re-select it in the action config.")
+                return
+
+            if operation == "enable":
+                alarm.enabled = True
+            elif operation == "disable":
+                alarm.enabled = False
+            else:
+                alarm.enabled = not alarm.enabled
+
+            volume_note = ""
+            if volume_raw:
+                try:
+                    alarm.volume = max(0, min(100, int(volume_raw)))
+                    volume_note = f", volume {alarm.volume}"
+                except (TypeError, ValueError):
+                    self.logger.warning(f"⚠️ Ignoring invalid alarm volume '{volume_raw}' (expected 0-100)")
+
+            alarm.save()
+            zone_name = getattr(getattr(alarm, "zone", None), "player_name", "?")
+            self.logger.info(f"⏰ Sonos alarm {alarm.start_time} ({zone_name}) → {'enabled' if alarm.enabled else 'disabled'}{volume_note}")
+
+        except Exception as exception_error:
+            self.exception_handler(exception_error, True)  # Log error and display failing statement
+
+    def actionPandoraThumbs(self, pluginAction, action):
+        """Pandora Thumbs Up / Thumbs Down — restored from the original plugin
+        (plugin.py forwarded here but the method was lost in a refactor)."""
+        try:
+            dev = indigo.devices[pluginAction.deviceId]
+            zoneIP = dev.pluginProps["address"]
+
+            if dev.states["GROUP_Coordinator"] == "false":
+                Coordinator = dev.states["GROUP_Name"]
+                for idev in indigo.devices.iter("self.ZonePlayer"):
+                    if idev.states["GROUP_Coordinator"] == "true" and idev.states["GROUP_Name"] == Coordinator:
+                        zoneIP = idev.pluginProps["address"]
+                        dev = indigo.devices[idev.id]
+                        break
+
+            if uri_pandora in dev.states["ZP_CurrentURI"]:
+                (x, y) = dev.states["ZP_CurrentURI"].split(':')
+                (stationId, z) = y.split('?')
+                PandoraStation = None
+                PandoraEmailAddress = None
+                for item in Sonos_Pandora:
+                    if item[0] == stationId:
+                        PandoraStation = item[1]
+                        PandoraEmailAddress = item[2]
+                        break
+                if PandoraEmailAddress is None:
+                    self.logger.error(f"Pandora station {stationId} not found in station list; cannot send feedback.")
+                    return
+                trackToken = self.parsePandoraToken(dev.states["ZP_CurrentTrackURI"])
+
+                if PandoraEmailAddress == self.PandoraEmailAddress:
+                    PandoraPassword = self.PandoraPassword
+                elif PandoraEmailAddress == self.PandoraEmailAddress2:
+                    PandoraPassword = self.PandoraPassword2
+                else:
+                    self.logger.error(f"No Pandora credentials match account '{PandoraEmailAddress}'.")
+                    return
+
+                pandora = Pandora()
+                pandora.authenticate(PandoraEmailAddress, PandoraPassword)
+
+                if action == "thumbs_up":
+                    thumbAction = "Thumbs Up"
+                    feedback = True
+                else:
+                    thumbAction = "Thumbs Down"
+                    feedback = False
+
+                try:
+                    thumb_status = pandora.add_feedback(stationId, trackToken, feedback)
+                    partist = thumb_status['artistName']
+                    ptrack = thumb_status['songName']
+                    if action == "thumbs_down":
+                        self.actionDirect(PA(dev.id), "Next")
+                    self.logger.info(f"{thumbAction} for station: {PandoraStation}, artist: {partist}, track: {ptrack} on ZonePlayer: {dev.name}")
+                except Exception:
+                    self.logger.error(f"Unable to {thumbAction} track on ZonePlayer: {dev.name}")
+
+            else:
+                self.logger.error(f"Pandora not actively playing on ZonePlayer: {dev.name}")
+
+        except Exception as exception_error:
+            self.exception_handler(exception_error, True)  # Log error and display failing statement
+
     def actionStates(self, pluginAction, action, only_device_ids=None):
         #indigo.server.log("did i hit 2 ????", type="Sonos PY Plugin Msg: 6778: ")
         global SavedState
@@ -6595,8 +6923,12 @@ class SonosPlugin(object):
             self.logger.error(f"❌ Failed to sort SiriusXM GUIDs: {e}")
 
         try:
-            for device in soco.discover():
-                self.soco_by_ip[device.ip_address] = device
+            discovered = soco.discover()
+            if discovered:
+                for device in discovered:
+                    self.soco_by_ip[device.ip_address] = device
+            else:
+                self.logger.warning("⚠️ SoCo discovery found no Sonos devices on the network (continuing)")
         except Exception as e:
             self.logger.error(f"❌ SoCo discovery failed (continuing): {e}")
 
@@ -6606,7 +6938,11 @@ class SonosPlugin(object):
                 self.rootZPIP = self.getReferencePlayerIP()
                 self.logger.info(f"✅ Using Reference ZonePlayer IP: {self.rootZPIP}")
 
-            if self.rootZPIP:
+            if not self.rootZPIP:
+                self.logger.error("❌ rootZPIP is not set. Cannot fetch Sonos playlists.")
+            elif not self.is_host_reachable(self.rootZPIP):
+                self.logger.warning(f"📴 Reference ZonePlayer {self.rootZPIP} is unreachable — skipping playlists/favorites load at startup.")
+            else:
                 try:
                     self.getSonosFavorites()
                     self.getPlaylistsDirect()
@@ -6614,8 +6950,6 @@ class SonosPlugin(object):
                     self.safe_debug("📥 Sonos playlists, favorites, and radio stations loaded.")
                 except Exception as e:
                     self.logger.error(f"❌ Failed loading playlists/favorites: {e}")
-            else:
-                self.logger.error("❌ rootZPIP is not set. Cannot fetch Sonos playlists.")
         except Exception as e:
             self.logger.error(f"❌ Reference player setup failed: {e}")
 
@@ -6629,28 +6963,15 @@ class SonosPlugin(object):
 
         try:
             for dev in indigo.devices.iter("com.ssi.indigoplugin.Sonos"):
-                self.initialize_custom_states(dev)
-        except Exception as e:
-            self.logger.error(f"❌ initialize_custom_states failed (continuing): {e}")
-
-        try:
-            for dev in indigo.devices.iter("com.ssi.indigoplugin.Sonos"):
-                # ✅ Ensure required states are initialized for each device
-                if "Grouped" not in dev.states:
-                    dev.updateStateOnServer("Grouped", False)
-                if "GROUP_Name" not in dev.states:
-                    dev.updateStateOnServer("GROUP_Name", "")
-                if "GROUP_Coordinator" not in dev.states:
-                    dev.updateStateOnServer("GROUP_Coordinator", "")
+                # Resyncs the state list from Devices.xml if required states are missing
+                dev = self.initialize_custom_states(dev) or dev
 
                 group_coordinator = dev.states.get("GROUP_Coordinator", "n/a")
                 #self.trace_me()
                 group_name = dev.states.get("GROUP_Name", "n/a")
-                Grouped = dev.states.get("GROUP_Grouped", "n/a")
+                Grouped = dev.states.get("Grouped", "n/a")
                 # NOTE: we now run evaluate/elevate AFTER bootstrap so we just log here.
                 self.logger.info(f"📊 Device '{dev.name}': Coordinator={group_coordinator}, Group='{group_name}', Grouped={Grouped}")
-
-
 
         except Exception as e:
             self.logger.error(f"❌ Per-device initialization loop failed (continuing): {e}")
@@ -6981,354 +7302,102 @@ class SonosPlugin(object):
     ############################################################################################
 
 
-    def old_deviceStartComm(self, indigo_device):
-        #self.logger.debug(f"🧪 deviceStartComm CALLED for {indigo_device.name}")
+    def is_host_reachable(self, ip, port=1400, timeout=2.0):
+        """Quick TCP probe so offline players can't stall the dispatch thread.
 
+        All Indigo UI callbacks (including opening config dialogs) are serviced
+        on the same thread as deviceStartComm — a single unreachable player
+        with a 10-20s (or unbounded) connect timeout freezes the whole plugin UI.
+        """
+        if not ip:
+            return False
         try:
-            self.logger.info(f"🔌 Starting communication with Indigo device {indigo_device.name} ({indigo_device.address})")
-            self.devices[indigo_device.id] = indigo_device
+            with socket.create_connection((ip, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
 
-            # Ensure lookup maps exist
-            if not hasattr(self, "soco_by_ip"):
-                self.soco_by_ip = {}
-            if not hasattr(self, "ip_to_indigo_device"):
-                self.ip_to_indigo_device = {}
-            if not hasattr(self, "uuid_to_indigo_device"):
-                self.uuid_to_indigo_device = {}
+    def _ip_probe_ok(self, ip, ttl=30.0, timeout=1.0):
+        """Reachability check with a short negative cache (shared with the ZGT walk).
 
-            # ✅ Ensure essential states exist before proceeding
-            if "Grouped" not in indigo_device.states:
-                indigo_device.updateStateOnServer("Grouped", False)
-            if "GROUP_Name" not in indigo_device.states:
-                indigo_device.updateStateOnServer("GROUP_Name", "")
-            if "GROUP_Coordinator" not in indigo_device.states:
-                indigo_device.updateStateOnServer("GROUP_Coordinator", "")
+        A player that fails the probe is skipped for `ttl` seconds so hot loops
+        (group evaluation, UID lookups, topology dumps) can't repeatedly hammer
+        an offline player with 10-20s SoCo network timeouts — one dead device
+        was enough to make Indigo log "timeout waiting for plugin response".
+        """
+        if not ip:
+            return False
+        if not hasattr(self, "_zgt_unreachable_until"):
+            self._zgt_unreachable_until = {}
+        now = time.time()
+        if self._zgt_unreachable_until.get(ip, 0.0) > now:
+            return False
+        if self.is_host_reachable(ip, timeout=timeout):
+            return True
+        self._zgt_unreachable_until[ip] = now + ttl
+        return False
 
-            # 🖼️ Preload ZP_ART with default placeholder if missing
-            if not indigo_device.states.get("ZP_ART"):
-                self.logger.debug(f"🖼️ Preloading ZP_ART with default placeholder for {indigo_device.name}")
-                self.logger.debug(f"🖼️ Updated artwork 7")
-                indigo_device.updateStateOnServer("ZP_ART", "/images/no_album_art.png")
+    def safe_uid(self, ip, soco_dev):
+        """Resolve a SoCo player's UID without repeated network timeouts.
 
-            # Force plugin to use upgraded SoCo library
-            import sys, os
-            upgraded_path = os.path.join(os.path.dirname(__file__), "soco-upgraded")
-            if upgraded_path not in sys.path:
-                sys.path.insert(0, upgraded_path)
-
-            import soco
-            from soco import SoCo
-            from soco.discovery import discover
-
-            self.logger.debug(f"🧪 SoCo loaded from: {getattr(soco, '__file__', 'unknown')}")
-            self.logger.debug(f"🧪 SoCo version: {getattr(soco, '__version__', 'unknown')}")
-
-            soco_device = None
-
-            # 🌐 First discovery attempt
-            try:
-                self.logger.info("🔍 Performing SoCo discovery to find matching device...")
-                discovered = discover(timeout=5)
-                if discovered:
-                    for dev in discovered:
-                        if dev.ip_address == indigo_device.address:
-                            soco_device = dev
-                            self.logger.info(f"✅ Found and initialized SoCo device for {indigo_device.name} at {dev.ip_address}")
-                            break
-                else:
-                    self.logger.warning("❌ No Sonos devices discovered on the network.")
-            except Exception as e:
-                self.logger.error(f"❌ SoCo discovery failed: {e}")
-
-            # 🔁 Retry discovery before fallback
-            if not soco_device:
-                self.logger.debug(f"🔁 Retrying SoCo discovery before fallback for {indigo_device.name}")
-                try:
-                    discovered_retry = discover(timeout=5)
-                    if discovered_retry:
-                        for dev in discovered_retry:
-                            if dev.ip_address == indigo_device.address:
-                                soco_device = dev
-                                self.logger.warning(f"✅ Found device on retry for {indigo_device.name} at {dev.ip_address}")
-                                break
-                except Exception as e:
-                    self.logger.error(f"❌ Retry discovery failed: {e}")
-
-            # 🧯 Fallback if discovery still failed
-            if not soco_device:
-                self.logger.debug(f"⚠️ Discovery failed — falling back to direct SoCo init for {indigo_device.name}")
-                try:
-                    soco_device = SoCo(indigo_device.address)
-                    self.logger.debug(f"✅ Fallback SoCo created for {indigo_device.name} at {indigo_device.address}")
-                except Exception as e:
-                    self.logger.error(f"❌ Direct SoCo init failed for {indigo_device.name}: {e}")
-                    return
-
-            # ✅ Always store in lookup maps
-            self.soco_by_ip[indigo_device.address] = soco_device
-            self.ip_to_indigo_device[indigo_device.address] = indigo_device
-            self.safe_debug(f"✅ soco_by_ip[{indigo_device.address}] stored with SoCo {getattr(soco_device, 'uid', 'unknown')}")
-
-            # 🆔 Update ZP_LocalUID from SoCo
-            try:
-                zp_uid = soco_device.uid
-                indigo_device.updateStateOnServer("ZP_LocalUID", value=zp_uid)
-                self.logger.debug(f"🆔 Set ZP_LocalUID for {indigo_device.name}: {zp_uid}")
-            except Exception as e:
-                self.logger.warning(f"⚠️ Failed to set ZP_LocalUID for {indigo_device.name}: {e}")
-
-            # 🧠 ✅ Patch: ensure UUID maps back to Indigo device
-            try:
-                zp_uid = soco_device.uid
-                if zp_uid:
-                    self.logger.debug(f"🔁 Mapping UUID {zp_uid} to Indigo device: {indigo_device.name}")
-                    self.uuid_to_indigo_device[zp_uid] = indigo_device
-            except Exception as e:
-                self.logger.error(f"❌ Failed to bind UUID to Indigo device in deviceStartComm: {e}")
-
-            # 🧪 Log model name
-            model_name = self.get_model_name(soco_device)
-            self.logger.debug(f"🧪 Retrieved model_name for {indigo_device.name}: {model_name}")
-            indigo_device.updateStateOnServer("ModelName", model_name)
-
-            # 🚀 Start event listener if needed
-            if not getattr(self, "event_listener_started", False):
-                try:
-                    from soco.events import event_listener
-                    self.logger.info("🚀 Starting SoCo Event Listener...")
-                    soco.config.EVENT_LISTENER_IP = self.find_sonos_interface_ip()
-                    event_listener.start(any_zone=soco_device)
-                    self.event_listener_started = True
-                    self.logger.debug(f"✅ SoCo Event Listener running: {event_listener.is_running}")
-                except Exception as e:
-                    self.logger.error(f"❌ Failed to start SoCo Event Listener: {e}")
-
-            # 🔔 Subscribe and update group state
-            try:
-                self.socoSubscribe(indigo_device, soco_device)
-                self.updateZoneGroupStates(indigo_device)
-            except Exception as e:
-                self.logger.error(f"❌ socoSubscribe() or updateZoneGroupStates() failed for {indigo_device.name}: {e}")
-
-            #self.initZones(indigo_device)
-            self.initZones(indigo_device, soco_device)
-            self.logger.debug(f"During start up - lets evaluate_and_update current grouped states - yes ????")
-            self.refresh_group_topology_after_plugin_zone_change()
-            #self.evaluate_and_update_grouped_states()
-
-            for dev in indigo.devices.iter("self"):
-                ip = dev.address
-                if ip:
-                    try:
-                        soco = SoCo(ip)
-                        self.ip_to_soco_device[ip] = soco
-                    except Exception as e:
-                        self.logger.warning(f"Failed to initialize SoCo for {ip}: {e}")
-
-            # … Run a single shot of dump_groups_to_log once fter deviceStartComm for all devices completes (or a short timer)
-            self._startup_warmup = False
-
-            # Debounced, one-shot dump once everything settles
-            self._schedule_one_shot_dump_groups(delay=8.0)
-
-
-
-
-        except Exception as e:
-            self.logger.error(f"✅ Error in deviceStartComm for {indigo_device.name}: {e}")
-
-
-
-
-
-    def old_deviceStartComm(self, indigo_device):
-        #self.logger.debug(f"🧪 deviceStartComm CALLED for {indigo_device.name}")
-
+        SoCo's .uid on a cold instance polls ZoneGroupState against the player's
+        own IP — for an offline player that's a full network timeout on EVERY
+        access. Resolution order: plugin cache → SoCo's own cache → the Indigo
+        device's ZP_LocalUID state → (only if the host answers a 1s probe) the
+        network. Returns None when unresolvable.
+        """
+        if not hasattr(self, "uid_by_ip"):
+            self.uid_by_ip = {}
+        uid = self.uid_by_ip.get(ip)
+        if uid:
+            return uid
+        # SoCo caches _uid after any successful fetch (or when parsed from ZGT XML)
+        cached = getattr(soco_dev, "_uid", None) if soco_dev is not None else None
+        if cached:
+            self.uid_by_ip[ip] = cached
+            return cached
+        # The Indigo device already knows its UID from a previous session
+        idev = (getattr(self, "ip_to_indigo_device", {}) or {}).get(ip)
+        if idev is not None:
+            state_uid = (idev.states.get("ZP_LocalUID") or "").strip()
+            if state_uid:
+                self.uid_by_ip[ip] = state_uid
+                return state_uid
+        if soco_dev is None or not self._ip_probe_ok(ip):
+            return None
         try:
-            self.logger.info(f"🔌 Starting communication with Indigo device {indigo_device.name} ({indigo_device.address})")
-            self.devices[indigo_device.id] = indigo_device
-
-            # Ensure lookup maps exist
-            if not hasattr(self, "soco_by_ip"):
-                self.soco_by_ip = {}
-            if not hasattr(self, "ip_to_indigo_device"):
-                self.ip_to_indigo_device = {}
-            if not hasattr(self, "uuid_to_indigo_device"):
-                self.uuid_to_indigo_device = {}
-            # --- NEW: ensure alternate SoCo map exists for helper consistency
-            if not hasattr(self, "ip_to_soco_device"):
-                self.ip_to_soco_device = {}
-
-            # ✅ Ensure essential states exist before proceeding
-            if "Grouped" not in indigo_device.states:
-                indigo_device.updateStateOnServer("Grouped", False)
-            if "GROUP_Name" not in indigo_device.states:
-                indigo_device.updateStateOnServer("GROUP_Name", "")
-            if "GROUP_Coordinator" not in indigo_device.states:
-                indigo_device.updateStateOnServer("GROUP_Coordinator", "")
-
-            # 🖼️ Preload ZP_ART with default placeholder if missing
-            if not indigo_device.states.get("ZP_ART"):
-                self.logger.debug(f"🖼️ Preloading ZP_ART with default placeholder for {indigo_device.name}")
-                self.logger.debug(f"🖼️ Updated artwork 7")
-                indigo_device.updateStateOnServer("ZP_ART", "/images/no_album_art.png")
-
-            # Force plugin to use upgraded SoCo library
-            import sys, os
-            upgraded_path = os.path.join(os.path.dirname(__file__), "soco-upgraded")
-            if upgraded_path not in sys.path:
-                sys.path.insert(0, upgraded_path)
-
-            import soco
-            from soco import SoCo
-            from soco.discovery import discover
-
-            self.logger.debug(f"🧪 SoCo loaded from: {getattr(soco, '__file__', 'unknown')}")
-            self.logger.debug(f"🧪 SoCo version: {getattr(soco, '__version__', 'unknown')}")
-
-            soco_device = None
-
-            # 🌐 First discovery attempt
-            try:
-                self.logger.info("🔍 Performing SoCo discovery to find matching device...")
-                discovered = discover(timeout=5)
-                if discovered:
-                    for dev in discovered:
-                        if dev.ip_address == indigo_device.address:
-                            soco_device = dev
-                            self.logger.info(f"✅ Found and initialized SoCo device for {indigo_device.name} at {dev.ip_address}")
-                            break
-                else:
-                    self.logger.warning("❌ No Sonos devices discovered on the network.")
-            except Exception as e:
-                self.logger.error(f"❌ SoCo discovery failed: {e}")
-
-            # 🔁 Retry discovery before fallback
-            if not soco_device:
-                self.logger.debug(f"🔁 Retrying SoCo discovery before fallback for {indigo_device.name}")
-                try:
-                    discovered_retry = discover(timeout=5)
-                    if discovered_retry:
-                        for dev in discovered_retry:
-                            if dev.ip_address == indigo_device.address:
-                                soco_device = dev
-                                self.logger.warning(f"✅ Found device on retry for {indigo_device.name} at {dev.ip_address}")
-                                break
-                except Exception as e:
-                    self.logger.error(f"❌ Retry discovery failed: {e}")
-
-            # 🧯 Fallback if discovery still failed
-            if not soco_device:
-                self.logger.debug(f"⚠️ Discovery failed — falling back to direct SoCo init for {indigo_device.name}")
-                try:
-                    soco_device = SoCo(indigo_device.address)
-                    self.logger.debug(f"✅ Fallback SoCo created for {indigo_device.name} at {indigo_device.address}")
-                except Exception as e:
-                    self.logger.error(f"❌ Direct SoCo init failed for {indigo_device.name}: {e}")
-                    return
-
-            # ✅ Always store in lookup maps
-            self.soco_by_ip[indigo_device.address] = soco_device
-            self.ip_to_indigo_device[indigo_device.address] = indigo_device
-            # --- NEW: also store in the map used elsewhere in the helper paths
-            self.ip_to_soco_device[indigo_device.address] = soco_device
-
-            self.safe_debug(f"✅ soco_by_ip[{indigo_device.address}] stored with SoCo {getattr(soco_device, 'uid', 'unknown')}")
-
-            # 🆔 Update ZP_LocalUID from SoCo
-            try:
-                zp_uid = soco_device.uid
-                indigo_device.updateStateOnServer("ZP_LocalUID", value=zp_uid)
-                self.logger.debug(f"🆔 Set ZP_LocalUID for {indigo_device.name}: {zp_uid}")
-            except Exception as e:
-                self.logger.warning(f"⚠️ Failed to set ZP_LocalUID for {indigo_device.name}: {e}")
-
-            # 🧠 ✅ Patch: ensure UUID maps back to Indigo device
-            try:
-                zp_uid = soco_device.uid
-                if zp_uid:
-                    self.logger.debug(f"🔁 Mapping UUID {zp_uid} to Indigo device: {indigo_device.name}")
-                    self.uuid_to_indigo_device[zp_uid] = indigo_device
-            except Exception as e:
-                self.logger.error(f"❌ Failed to bind UUID to Indigo device in deviceStartComm: {e}")
-
-            # 🧪 Log model name
-            model_name = self.get_model_name(soco_device)
-            self.logger.debug(f"🧪 Retrieved model_name for {indigo_device.name}: {model_name}")
-            indigo_device.updateStateOnServer("ModelName", model_name)
-
-            # --- NEW: immediate seed from live SoCo for this device (esp. for coordinators)
-            try:
-                if hasattr(self, "_soco_group_truth") and hasattr(self, "_set_group_states"):
-                    is_coord, is_grouped, gname = self._soco_group_truth(soco_device)
-                    self.logger.debug(f"[coord-seed] {indigo_device.name} ip={indigo_device.address} "
-                                      f"live(coord={is_coord}, grouped={is_grouped}, name='{gname}')")
-                    # Always perform a local seed write; group propagation happens later via helper
-                    seed_name = gname or indigo_device.states.get("GROUP_Name", "").strip() or indigo_device.name
-                    self._set_group_states(indigo_device, grouped=bool(is_grouped), is_coord=bool(is_coord), group_name=seed_name)
-            except Exception as e:
-                self.logger.warning(f"⚠️ coord-seed failed for {indigo_device.name}: {e}")
-
-            # 🚀 Start event listener if needed
-            if not getattr(self, "event_listener_started", False):
-                try:
-                    from soco.events import event_listener
-                    self.logger.info("🚀 Starting SoCo Event Listener...")
-                    soco.config.EVENT_LISTENER_IP = self.find_sonos_interface_ip()
-                    event_listener.start(any_zone=soco_device)
-                    self.event_listener_started = True
-                    self.logger.debug(f"✅ SoCo Event Listener running: {event_listener.is_running}")
-                except Exception as e:
-                    self.logger.error(f"❌ Failed to start SoCo Event Listener: {e}")
-
-            # 🔔 Subscribe and update group state
-            try:
-                self.socoSubscribe(indigo_device, soco_device)
-                self.updateZoneGroupStates(indigo_device)
-            except Exception as e:
-                self.logger.error(f"❌ socoSubscribe() or updateZoneGroupStates() failed for {indigo_device.name}: {e}")
-
-            #self.initZones(indigo_device)
-            self.initZones(indigo_device, soco_device)
-            self.logger.debug(f"During start up - lets evaluate_and_update current grouped states - yes ????")
-            self.refresh_group_topology_after_plugin_zone_change()
-            #self.evaluate_and_update_grouped_states()
-
-            for dev in indigo.devices.iter("self"):
-                ip = dev.address
-                if ip:
-                    try:
-                        soco = SoCo(ip)
-                        # keep both maps in sync
-                        self.ip_to_soco_device[ip] = soco
-                        self.soco_by_ip[ip] = soco
-                    except Exception as e:
-                        self.logger.warning(f"Failed to initialize SoCo for {ip}: {e}")
-
-            # --- NEW: one safe post-discovery sweep when inputs are ready
-            try:
-                if hasattr(self, "_ready_for_group_refresh") and self._ready_for_group_refresh():
-                    self.logger.debug("[post-discovery] inputs ready → running _refresh_all_group_states_helper('post-discovery')")
-                    self._refresh_all_group_states_helper(reason="post-discovery")
-                else:
-                    groups_ct = len(getattr(self, "zone_group_state_cache", {}) or {})
-                    ip2dev_ct = len(getattr(self, "ip_to_indigo_device", {}) or {})
-                    soco_ct   = len(getattr(self, "ip_to_soco_device", {}) or {})
-                    self.logger.debug(f"[post-discovery] not ready; groups={groups_ct} ip→dev={ip2dev_ct} soco_by_ip={soco_ct}")
-            except Exception as e:
-                self.logger.warning(f"⚠️ post-discovery refresh failed: {e}")
-
-            # … Run a single shot of dump_groups_to_log once fter deviceStartComm for all devices completes (or a short timer)
-            self._startup_warmup = False
-
-            # Debounced, one-shot dump once everything settles
-            self._schedule_one_shot_dump_groups(delay=8.0)
-
+            uid = soco_dev.uid
+            if uid:
+                self.uid_by_ip[ip] = uid
+            return uid
         except Exception as e:
-            self.logger.error(f"✅ Error in deviceStartComm for {indigo_device.name}: {e}")
+            self.logger.debug(f"safe_uid: could not fetch UID from {ip}: {e}")
+            return None
 
+    def retry_deferred_devices(self):
+        """Retry startup for devices that were offline when deviceStartComm ran.
 
-
+        Called periodically from plugin.py's runConcurrentThread.
+        """
+        deferred = getattr(self, "deferred_start_devices", None)
+        if not deferred:
+            return
+        for dev_id in list(deferred):
+            try:
+                dev = indigo.devices[dev_id]
+            except KeyError:
+                deferred.discard(dev_id)
+                continue
+            if not dev.enabled:
+                deferred.discard(dev_id)
+                continue
+            if self.is_host_reachable(dev.address):
+                self.logger.info(f"🔄 {dev.name} ({dev.address}) is reachable again — starting device.")
+                deferred.discard(dev_id)
+                try:
+                    self.deviceStartComm(dev)
+                except Exception as e:
+                    self.logger.error(f"❌ Deferred deviceStartComm failed for {dev.name}: {e}")
 
     def deviceStartComm(self, indigo_device):
         #self.logger.debug(f"🧪 deviceStartComm CALLED for {indigo_device.name}")
@@ -7348,13 +7417,23 @@ class SonosPlugin(object):
             if not hasattr(self, "ip_to_soco_device"):
                 self.ip_to_soco_device = {}
 
-            # ✅ Ensure essential states exist before proceeding
-            if "Grouped" not in indigo_device.states:
-                indigo_device.updateStateOnServer("Grouped", False)
-            if "GROUP_Name" not in indigo_device.states:
-                indigo_device.updateStateOnServer("GROUP_Name", "")
-            if "GROUP_Coordinator" not in indigo_device.states:
-                indigo_device.updateStateOnServer("GROUP_Coordinator", False)  # CHANGED: write real boolean, not ""
+            # ✅ Ensure essential states exist before proceeding (resyncs state list from Devices.xml if needed)
+            indigo_device = self.initialize_custom_states(indigo_device) or indigo_device
+            self.devices[indigo_device.id] = indigo_device
+
+            # 🚦 Fast reachability gate — an offline player must not stall the dispatch
+            # thread (it also services all config dialogs) with long connect timeouts.
+            if not hasattr(self, "deferred_start_devices"):
+                self.deferred_start_devices = set()
+            if not self.is_host_reachable(indigo_device.address):
+                self.logger.warning(
+                    f"📴 {indigo_device.name} ({indigo_device.address}) is unreachable — "
+                    f"deferring startup for this device; will retry in background.")
+                indigo_device.setErrorStateOnServer("offline")
+                self.deferred_start_devices.add(indigo_device.id)
+                return
+            self.deferred_start_devices.discard(indigo_device.id)
+            indigo_device.setErrorStateOnServer(None)  # clear any previous 'offline' flag
 
             # 🖼️ Preload ZP_ART with default placeholder if missing
             if not indigo_device.states.get("ZP_ART"):
@@ -7375,45 +7454,18 @@ class SonosPlugin(object):
             self.logger.debug(f"🧪 SoCo loaded from: {getattr(soco, '__file__', 'unknown')}")
             self.logger.debug(f"🧪 SoCo version: {getattr(soco, '__version__', 'unknown')}")
 
-            soco_device = None
-
-            # 🌐 First discovery attempt
-            try:
-                self.logger.info("🔍 Performing SoCo discovery to find matching device...")
-                discovered = discover(timeout=5)
-                if discovered:
-                    for dev in discovered:
-                        if dev.ip_address == indigo_device.address:
-                            soco_device = dev
-                            self.logger.info(f"✅ Found and initialized SoCo device for {indigo_device.name} at {dev.ip_address}")
-                            break
-                else:
-                    self.logger.warning("❌ No Sonos devices discovered on the network.")
-            except Exception as e:
-                self.logger.error(f"❌ SoCo discovery failed: {e}")
-
-            # 🔁 Retry discovery before fallback
-            if not soco_device:
-                self.logger.debug(f"🔁 Retrying SoCo discovery before fallback for {indigo_device.name}")
-                try:
-                    discovered_retry = discover(timeout=5)
-                    if discovered_retry:
-                        for dev in discovered_retry:
-                            if dev.ip_address == indigo_device.address:
-                                soco_device = dev
-                                self.logger.warning(f"✅ Found device on retry for {indigo_device.name} at {dev.ip_address}")
-                                break
-                except Exception as e:
-                    self.logger.error(f"❌ Retry discovery failed: {e}")
-
-            # 🧯 Fallback if discovery still failed
-            if not soco_device:
-                self.logger.debug(f"⚠️ Discovery failed — falling back to direct SoCo init for {indigo_device.name}")
+            # ♻️ Reuse the SoCo instance from startup discovery when available; otherwise
+            # talk to the (known-reachable) player directly. The previous per-device
+            # network discovery sweeps (2 × 5s each) only stalled the dispatch thread —
+            # matching the discovery result by IP is equivalent to SoCo(ip) directly.
+            soco_device = self.soco_by_ip.get(indigo_device.address)
+            if soco_device is None:
                 try:
                     soco_device = SoCo(indigo_device.address)
-                    self.logger.debug(f"✅ Fallback SoCo created for {indigo_device.name} at {indigo_device.address}")
+                    self.logger.debug(f"✅ Created SoCo for {indigo_device.name} at {indigo_device.address}")
                 except Exception as e:
                     self.logger.error(f"❌ Direct SoCo init failed for {indigo_device.name}: {e}")
+                    indigo_device.setErrorStateOnServer("error")
                     return
 
             # ✅ Always store in lookup maps
@@ -7709,10 +7761,46 @@ class SonosPlugin(object):
                         found_ip = str(ip_addr)
                         return found_ip  # Return immediately on first match
 
-            if not found_ip:
-                self.logger.warning(f"❌ No interface found on target Sonos subnet {target_net}")
+            # 🔀 Routed-subnet fallback: no local interface sits directly on the Sonos
+            # subnet (e.g. players on 192.168.30.0/24, this Mac on 192.168.1.0/24 with a
+            # router in between). The players are still reachable — ask the OS which
+            # source IP it would use to route to one and publish that instead.
+            probe_ip = None
+            for candidate_ip in list(getattr(self, "soco_by_ip", {}) or {}):
+                probe_ip = candidate_ip
+                break
+            if probe_ip is None:
+                try:
+                    for idev in indigo.devices.iter("com.ssi.indigoplugin.Sonos"):
+                        if idev.address:
+                            probe_ip = idev.address
+                            break
+                except Exception:
+                    pass
+            if probe_ip is None:
+                root_ip = getattr(self, "rootZPIP", None)
+                if root_ip and root_ip != "auto":
+                    probe_ip = root_ip
+            if probe_ip is None:
+                try:
+                    probe_ip = str(next(target_net.hosts()))  # first host of the target subnet
+                except Exception:
+                    probe_ip = None
 
-            return found_ip
+            if probe_ip:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                        s.connect((probe_ip, 1400))  # no packet sent — just resolves routing
+                        found_ip = s.getsockname()[0]
+                    self.logger.info(
+                        f"   ✅ No interface directly on {target_net}; Sonos subnet appears routed — "
+                        f"using source IP {found_ip} (via route to {probe_ip})")
+                    return found_ip
+                except Exception as e:
+                    self.logger.debug(f"Routed-IP fallback via {probe_ip} failed: {e}")
+
+            self.logger.warning(f"❌ No interface found on target Sonos subnet {target_net} (and no routed fallback available)")
+            return None
 
         except Exception as e:
             self.logger.exception(f"❌ Exception in find_sonos_interface_ip: {e}")
@@ -8457,7 +8545,8 @@ class SonosPlugin(object):
                 soco_by_ip = getattr(self, "soco_by_ip", {}) or {}
             ok = (len(groups) > 0) and (len(ip2dev) > 0) and (len(soco_by_ip) > 0)
             if not ok:
-                self.logger.warning(
+                # Normal transient state while devices are still starting — debug, not warning
+                self.logger.debug(
                     f"[ready-probe] NOT READY for refresh: groups={len(groups)} ip→dev={len(ip2dev)} soco_by_ip={len(soco_by_ip)}"
                 )
             else:
@@ -9023,31 +9112,24 @@ class SonosPlugin(object):
                 self.safe_debug(f"✅ Found {ip_address} in soco_device_cache")
                 return self.soco_device_cache[ip_address]
 
-            # Try to discover devices
-            from soco import discover, SoCo
-            devices = discover()
-            if devices:
-                self.safe_debug(f"🔍 Discovered devices: {[dev.ip_address for dev in devices]}")
-                for dev in devices:
-                    self.soco_device_cache[dev.ip_address] = dev
+            # ♻️ Reuse the instance from startup discovery when available
+            known = getattr(self, "soco_by_ip", {}).get(ip_address)
+            if known is not None:
+                self.soco_device_cache[ip_address] = known
+                return known
 
-                if ip_address in self.soco_device_cache:
-                    self.safe_debug(f"✅ Found {ip_address} after discovery")
-                    return self.soco_device_cache[ip_address]
-                else:
-                    self.logger.debug(f"⚠️ IP {ip_address} not found in discovered devices")
-            else:
-                self.logger.warning("⚠️ No SoCo devices discovered")
-
-            # 🔁 NEW: fallback to direct SoCo init
-            self.logger.debug(f"⚠️ getSoCoDeviceByIP({ip_address}) returned None — attempting fallback init...")
+            # Direct init by IP — equivalent to a discovery match, and it works across
+            # routed subnets/VLANs where multicast discovery can never reach (previously
+            # this ran a 5s discovery sweep and warned "No SoCo devices discovered" on
+            # every cache miss in such setups).
+            from soco import SoCo
             try:
-                fallback_device = SoCo(ip_address)
-                self.soco_device_cache[ip_address] = fallback_device
-                self.logger.debug(f"✅ Fallback SoCo added to soco_device_cache[{ip_address}]")
-                return fallback_device
-            except Exception as fallback_error:
-                self.logger.error(f"❌ Fallback SoCo init failed in getSoCoDeviceByIP: {fallback_error}")
+                device = SoCo(ip_address)
+                self.soco_device_cache[ip_address] = device
+                self.safe_debug(f"✅ Direct SoCo init for {ip_address}")
+                return device
+            except Exception as init_error:
+                self.logger.error(f"❌ Direct SoCo init failed in getSoCoDeviceByIP({ip_address}): {init_error}")
                 return None
 
         except Exception as e:
@@ -9407,12 +9489,11 @@ class SonosPlugin(object):
 
 
     def get_soco_by_uuid(self, uuid):
-        for ip, soco in self.soco_by_ip.items():
-            try:
-                if soco.uid == uuid:
-                    return soco
-            except Exception as e:
-                self.logger.warning(f"⚠️ Could not retrieve UID from SoCo at {ip}: {e}")
+        # safe_uid resolves from cache / Indigo state and probe-gates any network
+        # access — previously every call burned a 10s timeout per offline player.
+        for ip, soco in list(self.soco_by_ip.items()):
+            if self.safe_uid(ip, soco) == uuid:
+                return soco
         self.logger.debug(f"🔍 No SoCo found for UUID {uuid}")
         return None
 
@@ -9533,9 +9614,20 @@ class SonosPlugin(object):
 
 
     def initialize_custom_states(self, dev):
+        """Ensure required custom states exist on the device.
+
+        States can only be defined in Devices.xml — updateStateOnServer() cannot
+        create them (the server ignores the update and logs "state key ... not
+        defined"). If a required key is missing, the device was created before
+        the state was added to Devices.xml, so force Indigo to resync its state
+        list with stateListOrDisplayStateIdChanged().
+
+        Returns a refreshed copy of the device (or the original if no resync
+        was needed), so callers can keep using an up-to-date state list.
+        """
         if dev is None:
             self.logger.warning("🚫 initialize_custom_states called with None device!")
-            return
+            return None
 
         required_keys = [
             "Grouped",
@@ -9545,18 +9637,20 @@ class SonosPlugin(object):
             "ZP_LocalUID",
         ]
 
-        created_keys = []
+        missing_keys = [key for key in required_keys if key not in dev.states]
+        if not missing_keys:
+            return dev
 
-        for key in required_keys:
-            if key not in dev.states:
-                self.logger.warning(f"🔧 Initializing missing state '{key}' on device: {dev.name}")
-                dev.updateStateOnServer(key, "")
-                created_keys.append(key)
-            else:
-                self.logger.debug(f"✅ State key '{key}' already present on device: {dev.name}")
+        self.logger.info(f"🔧 State list for {dev.name} is missing {', '.join(missing_keys)} — resyncing from Devices.xml")
+        dev.stateListOrDisplayStateIdChanged()
+        dev = indigo.devices[dev.id]  # refresh local copy so it has the new state list
 
-        if created_keys:
-            self.logger.info(f"🛠 Initialized missing states on {dev.name}: {', '.join(created_keys)}")
+        still_missing = [key for key in missing_keys if key not in dev.states]
+        if still_missing:
+            self.logger.error(f"❌ States still missing on {dev.name} after resync: {', '.join(still_missing)} — check Devices.xml")
+        else:
+            self.logger.info(f"🛠 State list resynced for {dev.name}: added {', '.join(missing_keys)}")
+        return dev
 
 
 
@@ -9581,11 +9675,8 @@ class SonosPlugin(object):
 
         # Initialize required custom states
         if dev:
-            if dev is not None:
-                self.logger.debug(f"⚙️ Evaluating group state for device: {dev.name}")
-                self.initialize_custom_states(dev)
-            else:
-                self.logger.warning("🚫 Received 'None' for dev argument — skipping initialize_custom_states()")
+            self.logger.debug(f"⚙️ Evaluating group state for device: {dev.name}")
+            dev = self.initialize_custom_states(dev) or dev
         else:
             self.logger.debug("⚙️ Evaluating group state for all Sonos devices...")
             for d in indigo.devices.iter("com.ssi.indigoplugin.Sonos"):
@@ -10116,10 +10207,23 @@ class SonosPlugin(object):
                     # keys may be str or int depending on where they were inserted
                     subs = self.soco_subs.pop(str(dev.id), None) or self.soco_subs.pop(dev.id, None)
                 if subs:
+                    # A network unsubscribe against an offline player blocks in connect
+                    # timeouts — with several devices this makes Indigo force-kill the
+                    # plugin on reload. Only unsubscribe over the network if the player
+                    # answers a quick probe; otherwise just cancel the local auto-renew
+                    # (the player-side subscription expires on its own).
+                    reachable = self.is_host_reachable(dev.address, timeout=1.0)
                     for svc_name, sub in list(subs.items()):
                         try:
-                            sub.unsubscribe()
-                            self.logger.debug(f"🔕 Unsubscribed {svc_name} for {dev.name}")
+                            if reachable:
+                                sub.unsubscribe()
+                                self.logger.debug(f"🔕 Unsubscribed {svc_name} for {dev.name}")
+                            else:
+                                try:
+                                    sub._auto_renew_cancel()  # SoCo internal, best-effort
+                                except Exception:
+                                    pass
+                                self.logger.debug(f"🔕 Skipped network unsubscribe ({svc_name}, {dev.name} offline); cancelled auto-renew")
                         except Exception as e:
                             self.logger.debug(f"⚠️ Unsubscribe failed ({svc_name}, {dev.name}): {e}")
             except Exception as e:
@@ -10263,6 +10367,20 @@ class SonosPlugin(object):
         #self.logger.warning("🔁 Manually refreshing group topology after plugin-initiated zone change...")
 
         try:
+            # 🧯 Debounce — an announcement ungroups/regroups several zones in quick
+            # succession and each change lands here; without this, every call walks
+            # every player with 5s-timeout fetches (the "ZGT storm" of issue #16).
+            # Only debounce once the cache has populated at least once, so rapid-fire
+            # startup calls (devices now start fast) can't starve the first real fetch.
+            now = time.time()
+            if getattr(self, "zone_group_state_cache", None) and \
+                    now - getattr(self, "_last_topology_refresh", 0.0) < 3.0:
+                self.logger.debug("⏳ Skipping topology refresh (debounced — ran <3s ago)")
+                return
+            self._last_topology_refresh = now
+            if not hasattr(self, "_zgt_unreachable_until"):
+                self._zgt_unreachable_until = {}
+
             # NEW: ensure coordinator-by-IP map exists on the instance for downstream use
             if not hasattr(self, "_eval_coord_dev_by_ip") or not isinstance(getattr(self, "_eval_coord_dev_by_ip"), dict):
                 self._eval_coord_dev_by_ip = {}
@@ -10332,6 +10450,15 @@ class SonosPlugin(object):
 
             #for ip in self.soco_by_ip.keys():
             for ip in list(self.soco_by_ip.keys()):
+                # Skip players that recently failed a reachability probe (30s negative
+                # cache) — walking dead hosts at 5s timeout each is what melted things
+                # down in issue #16 once a couple of speakers dropped off the network.
+                if self._zgt_unreachable_until.get(ip, 0.0) > now:
+                    continue
+                if not self.is_host_reachable(ip, timeout=1.0):
+                    self._zgt_unreachable_until[ip] = now + 30.0
+                    self.logger.debug(f"📴 Skipping ZGT fetch from unreachable {ip} (cached for 30s)")
+                    continue
                 raw_xml = get_zone_group_state_from_player(ip)
                 if raw_xml:
                     parsed = parse_zone_group_state(raw_xml)
@@ -11171,7 +11298,7 @@ class SonosPlugin(object):
 
         url = u"http://" + zoneIP + ":1400/status/zp"
         try:
-            response = requests.get(url)
+            response = requests.get(url, timeout=5)
             root = ET.fromstring(response.content)
             ZoneName = root.findtext('.//ZoneName')
             LocalUID = root.findtext('.//LocalUID')
@@ -11183,7 +11310,8 @@ class SonosPlugin(object):
             self.plugin.errorLog("  Offending ZonePlayer: %s" % dev.name)
             self.plugin.errorLog("  ZonePlayer may be physically turned off or in a bad state.")
             self.plugin.errorLog("  Please disable communications or remove from Indigo.")
-            self.deviceList.remove(dev.id)
+            if dev.id in self.deviceList:  # guard: raised "list.remove(x): x not in list" (issue #16)
+                self.deviceList.remove(dev.id)
             dev.setErrorStateOnServer(u"error")
             return
 
@@ -11214,7 +11342,7 @@ class SonosPlugin(object):
 
     def getModelName(self, dev):
         url = u"http://" + dev.pluginProps["address"] + ":1400/xml/device_description.xml"
-        response = requests.get(url)
+        response = requests.get(url, timeout=5)
         if response.ok:
             root = ET.fromstring(response.content)
             ModelName = root.findtext('.//{urn:schemas-upnp-org:device-1-0}displayName')
@@ -11464,7 +11592,7 @@ class SonosPlugin(object):
         if ip in self.soco_by_ip:
             return self.soco_by_ip[ip]
 
-        self.logger.warning(f"⚠️ get_soco_device: IP {ip} not found in soco_by_ip. Performing fallback discovery.")
+        self.logger.debug(f"get_soco_device: IP {ip} not in soco_by_ip cache — creating direct SoCo instance.")
         try:
             soco_device = soco.SoCo(ip)
             self.soco_by_ip[ip] = soco_device
@@ -11758,7 +11886,7 @@ class SonosPlugin(object):
             }
 
             try:
-                response = requests.post(base_url + control_url, headers=headers, data=SoapMessage.encode("utf-8"))
+                response = requests.post(base_url + control_url, headers=headers, data=SoapMessage.encode("utf-8"), timeout=(5, 20))
             except Exception as exception_error:
                 self.logger.error(f"SOAPSend Error: {exception_error}")
                 raise
