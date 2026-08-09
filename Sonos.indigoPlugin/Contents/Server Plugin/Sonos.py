@@ -78,6 +78,7 @@ except ImportError:
 try:
     from mutagen.mp3 import MP3
     from mutagen.aiff import AIFF
+    from mutagen.wave import WAVE
 except ImportError:
     pass
 
@@ -229,6 +230,26 @@ class Old_save_PA():
 
 
 # Safe PluginAction helper (drop-in replacement)
+class _VolumeOnlySnap(object):
+    """Minimal announcement snapshot for players whose full soco Snapshot fails.
+
+    Right after grouping churn a player can report its own queue URI while
+    soco's topology still calls it a slave — the stock Snapshot then dies on
+    coordinator-only properties (cross_fade). Mirror what soco restores for
+    slaves anyway: volume and mute only.
+    """
+    media_uri = ""
+
+    def __init__(self, soco_device):
+        self.device = soco_device
+        self.volume = soco_device.volume
+        self.mute = soco_device.mute
+
+    def restore(self, fade=False):
+        self.device.volume = self.volume
+        self.device.mute = self.mute
+
+
 class PA(object):
     def __init__(self, deviceId=None, props=None):
         # Always store deviceId as int when possible
@@ -618,7 +639,7 @@ class SonosPlugin(object):
             # Assign correct target IP
             zoneIP = coordinator_ip
             if coordinator_dev.id != dev.id:
-                self.logger.warning(f"🔁 Redirecting control from slave {dev.name} to coordinator {coordinator_dev.name} at {zoneIP}")
+                self.logger.debug(f"🔁 Redirecting control from slave {dev.name} to coordinator {coordinator_dev.name} at {zoneIP}")
             else:
                 self.logger.debug(f"✅ {dev.name} is the coordinator — using direct control")
 
@@ -3300,13 +3321,29 @@ class SonosPlugin(object):
 
             ip, port, root = self.get_announce_http_config()
             os.makedirs(root, exist_ok=True)
+            # Remember the root actually being served — announcement builders must
+            # write their audio here (prefs may change after the server started).
+            self._announce_http_root = root
 
             class AnnouncementHandler(http.server.SimpleHTTPRequestHandler):
                 def __init__(self, *args, **kwargs):
                     super().__init__(*args, directory=root, **kwargs)
+                def _mark_fetch(self):
+                    # Record who pulled from us — the announcement flow checks this
+                    # to detect players that can't reach the server (VLAN/firewall).
+                    try:
+                        self.server.parent_plugin._announce_last_fetch[self.client_address[0]] = time.time()
+                    except Exception:
+                        pass
+                def do_GET(self):
+                    self._mark_fetch()
+                    super().do_GET()
+                def do_HEAD(self):
+                    self._mark_fetch()
+                    super().do_HEAD()
                 def log_message(self, fmt, *args):
                     try:
-                        self.server.parent_logger.debug("[ANN HTTP] " + fmt % args)
+                        self.server.parent_logger.debug(f"[ANN HTTP] {self.client_address[0]} " + fmt % args)
                     except Exception:
                         pass
 
@@ -3321,6 +3358,9 @@ class SonosPlugin(object):
             # Create & start server
             self._announce_httpd = ThreadedTCPServer((bind_host, port), AnnouncementHandler)
             self._announce_httpd.parent_logger = self.logger
+            self._announce_httpd.parent_plugin = self
+            if not hasattr(self, "_announce_last_fetch"):
+                self._announce_last_fetch = {}
 
             t = threading.Thread(target=self._announce_httpd.serve_forever, daemon=True)
             t.start()
@@ -5648,12 +5688,19 @@ class SonosPlugin(object):
                 return
 
             # ===== build/prepare the announcement audio asset =====
+            # Every engine must write into the root the 8889 announce server
+            # actually serves, and the duration probe below must read that same
+            # file — the TTS engines used to write to the plugin CWD (served as
+            # 404) and the probe read the CWD too, so a stale CWD file's length
+            # truncated File announcements at the wrong duration.
+            announce_root = (getattr(self, "_announce_http_root", "")
+                             or self.get_announce_http_config()[2] or ".")
             try:
                 if source == "tts":
                     announcement = self.plugin.substitute(props.get("setting"), validateOnly=False)
                     zp_language = props.get("language")
                     tts = gTTS(text=announcement, lang=zp_language)
-                    tts.save('announcement.mp3')
+                    tts.save(os.path.join(announce_root, 'announcement.mp3'))
                     s_announcement = "announcement.mp3"
                     tts_delay = 0
 
@@ -5664,7 +5711,7 @@ class SonosPlugin(object):
                     v.voice_name = IVONAVoices[int(props.get("IVONA_voice"))][1]
                     v.sentence_break = int(props.get("IVONA_sentence_break"))
                     v.speech_rate = props.get("IVONA_speech_rate")
-                    v.fetch_voice(announcement, 'announcement')
+                    v.fetch_voice(announcement, os.path.join(announce_root, 'announcement'))
                     s_announcement = "announcement.mp3"
                     tts_delay = 0.5
                     self.plugin.sleep(0.5)  # allow file creation
@@ -5677,24 +5724,60 @@ class SonosPlugin(object):
                     if "AudioStream" in response:
                         with closing(response["AudioStream"]) as stream:
                             data = stream.read()
-                            with open("announcement.mp3", "wb") as f:
+                            with open(os.path.join(announce_root, "announcement.mp3"), "wb") as f:
                                 f.write(data)
                     s_announcement = "announcement.mp3"
                     tts_delay = 0.5
 
                 elif source == "apple":
                     announcement = self.plugin.substitute(props.get("APPLE_setting"), validateOnly=False)
-                    sp = NSSpeechSynthesizer.alloc().initWithVoice_(props.get("APPLE_voice"))
-                    ru = NSURL.fileURLWithPath_("./announcement.aiff")
-                    sp.startSpeakingString_toURL_(announcement, ru)
-                    s_announcement = "announcement.aiff"
+                    apple_voice = (props.get("APPLE_voice") or "").strip()
+                    # Older configs stored NSSpeechSynthesizer ids
+                    # (com.apple.voice.compact.en-US.Samantha) — resolve to the
+                    # plain voice name `say` expects.
+                    if apple_voice.startswith("com.apple."):
+                        resolved = None
+                        try:
+                            attrs = NSSpeechSynthesizer.attributesForVoice_(apple_voice) or {}
+                            resolved = attrs.get("VoiceName")
+                        except Exception:
+                            resolved = None
+                        apple_voice = resolved or apple_voice.rsplit(".", 1)[-1]
+                    wav_path = os.path.join(announce_root, "announcement.wav")
+                    try:
+                        if os.path.exists(wav_path):
+                            os.remove(wav_path)
+                    except Exception:
+                        pass
+                    # NSSpeechSynthesizer is deprecated and renders SILENCE for many
+                    # modern voices — the `say` CLI is synchronous and voice-complete.
+                    # Output WAV 44.1kHz/16-bit: say's AIFF output is actually an
+                    # AIFF-C container, which Sonos rejects ("not encoded correctly");
+                    # WAVE at 44.1k verified playing on a real player.
+                    import subprocess
+                    cmd = ["/usr/bin/say", "-o", wav_path, "--data-format=LEI16@44100"]
+                    if apple_voice:
+                        cmd += ["-v", apple_voice]
+                    cmd.append(announcement)
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                    if result.returncode != 0 and apple_voice:
+                        self.logger.warning(
+                            f"⚠️ Apple voice {apple_voice!r} failed ({(result.stderr or '').strip()}) — "
+                            f"retrying with the system default voice")
+                        result = subprocess.run(["/usr/bin/say", "-o", wav_path,
+                                                 "--data-format=LEI16@44100", announcement],
+                                                capture_output=True, text=True, timeout=60)
+                    if result.returncode != 0 or not os.path.isfile(wav_path) or os.path.getsize(wav_path) == 0:
+                        self.logger.error(f"❌ Apple speech synthesis failed: {(result.stderr or 'no output').strip()}")
+                        return
+                    s_announcement = "announcement.wav"
                     tts_delay = 0.5
-                    self.plugin.sleep(0.5)
 
                 elif source == "microsoft":
                     announcement = self.plugin.substitute(props.get("MICROSOFT_setting"), validateOnly=False)
                     language = props.get("MICROSOFT_voice")
-                    statinfo = self.MicrosoftTranslate(announcement, language)
+                    statinfo = self.MicrosoftTranslate(announcement, language,
+                                                       out_path=os.path.join(announce_root, "announcement.mp3"))
                     s_announcement = "announcement.mp3"
                     tts_delay = 0.5
                     if statinfo is False:
@@ -5714,9 +5797,9 @@ class SonosPlugin(object):
                         return
 
                     # IMPORTANT:
-                    # The announcement HTTP server serves from self.SoundFilePath,
+                    # The announcement HTTP server serves from announce_root,
                     # so write announcement.mp3 there, not the plugin working directory.
-                    dst = os.path.join(self.SoundFilePath or "", "announcement.mp3")
+                    dst = os.path.join(announce_root, "announcement.mp3")
 
 
 
@@ -5759,106 +5842,189 @@ class SonosPlugin(object):
                 except Exception:
                     return None
 
-            # --- capture current playback state for quick restore (target device only) ---
-            prev = {
-                "uri": "", "meta": "", "pos": "00:00:00", "vol": None,
-                "state": "UNKNOWN",             # NEW: transport state
-                "mute": None,                   # NEW: device mute (0/1)
-                "per_dev_vol": {}, "per_dev_mute": {},  # NEW: per-device mutes
-                "group_vol": None, "group_mute": None   # existing + group mute now meaningful
-            }
-            try:
-                self.logger.debug(f"[ANNOUNCE SAVE] snapshot begin for {GM.name} @ {zoneIP}")
-                mi = self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "GetMediaInfo", "")
-                prev["meta"] = self.parseDirty(mi, "<CurrentURIMetaData>", "</CurrentURIMetaData>") or ""
-                prev["uri"]  = self.parseDirty(mi, "<CurrentURI>", "</CurrentURI>") or ""
-                pi = self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "GetPositionInfo", "")
+            # ===== SoCo Snapshot capture (preferred save/restore path) =====
+            # Same mechanism Home Assistant's Sonos integration uses. Selectable
+            # via plugin config; falls back to the legacy flow when disabled or
+            # when no snapshot could be captured.
+            def _pref_true(v, default=True):
+                if v is None:
+                    return default
+                return (v is True) or (str(v).strip().lower() in ("true", "1", "yes", "on"))
+
+            use_snapshot = _pref_true(self.plugin.pluginPrefs.get("useSocoSnapshot"), default=True)
+            announce_snapshots = []
+            if use_snapshot:
                 try:
-                    prev["pos"] = self.parseRelTime(GM, pi) or "00:00:00"
-                except Exception as e:
-                    self.logger.debug(f"[ANNOUNCE SAVE] parseRelTime failed: {e}")
-                    try:
-                        rel = self.parseDirty(pi, "<RelTime>", "</RelTime>") or ""
-                        prev["pos"] = rel if rel.count(":") == 2 else "00:00:00"
-                    except Exception:
-                        prev["pos"] = "00:00:00"
-
-                # NEW: Transport state (PLAYING/PAUSED_PLAYBACK/STOPPED)
-                try:
-                    ti = self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "GetTransportInfo", "")
-                    prev["state"] = (self.parseDirty(ti, "<CurrentTransportState>", "</CurrentTransportState>") or "UNKNOWN").strip()
-                except Exception as e:
-                    self.logger.debug(f"[ANNOUNCE SAVE] GetTransportInfo failed: {e}")
-
-                # Volume + mute on target device
-                try:
-                    gv = self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "GetVolume",
-                                       "<Channel>Master</Channel>")
-                    prev["vol"] = _as_int(self.parseCurrentVolume(gv))
-                except Exception as e:
-                    self.logger.debug(f"[ANNOUNCE SAVE] GetVolume failed: {e}")
-                    prev["vol"] = None
-
-                # NEW: device mute
-                try:
-                    gm_xml = self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "GetMute",
-                                           "<Channel>Master</Channel>")
-                    prev["mute"] = _as_int(self.parseCurrentMute(gm_xml))  # expect 0/1
-                except Exception as e:
-                    self.logger.debug(f"[ANNOUNCE SAVE] GetMute failed: {e}")
-                    prev["mute"] = None
-
-                self.logger.debug(f"[ANNOUNCE SAVE] uri={prev['uri']!r} pos={prev['pos']} vol={prev['vol']} "
-                                  f"state={prev['state']} mute={prev['mute']}")
-            except Exception as e:
-                self.logger.warning(f"⚠️ Failed to snapshot current state prior to announcement: {e}")
-
-            # --- capture volumes/mutes we will overwrite (per-device or group) ---
-            try:
-                if gc_only is False:
-                    # Per-device snapshot
-                    snap_cnt = 0
+                    from soco.snapshot import Snapshot
+                    # IPs of announcement zones — used to spot original group
+                    # members OUTSIDE the announcement (they need merging back).
+                    ann_ips = set()
+                    for _zid in AnnouncementZones:
+                        try:
+                            _zd = indigo.devices[int(_zid)]
+                            ann_ips.add((_zd.pluginProps.get("address") or _zd.address or "").strip())
+                        except Exception:
+                            pass
                     for item in AnnouncementZones:
                         try:
                             _dev = indigo.devices[int(item)]
                             _ip = (_dev.pluginProps.get("address") or _dev.address or "").strip()
-                            if not _ip:
-                                self.logger.debug(f"[ANNOUNCE SAVE] skip {_dev.name}: no IP")
+                            if not _ip or not self._ip_probe_ok(_ip):
+                                self.logger.debug(f"[ANNOUNCE SNAP] skip {_dev.name}: offline/no IP")
                                 continue
-                            # volume
-                            gv = self.SOAPSend(_ip, "/MediaRenderer", "/RenderingControl", "GetVolume",
-                                               "<Channel>Master</Channel>")
-                            v_raw = self.parseCurrentVolume(gv)
-                            v = _as_int(v_raw)
-                            prev["per_dev_vol"][_dev.id] = v
-                            # NEW: mute
-                            gm_xml = self.SOAPSend(_ip, "/MediaRenderer", "/RenderingControl", "GetMute",
-                                                   "<Channel>Master</Channel>")
-                            m = _as_int(self.parseCurrentMute(gm_xml))
-                            prev["per_dev_mute"][_dev.id] = m
-                            snap_cnt += 1
-                            self.logger.debug(f"[ANNOUNCE SAVE] captured {_dev.name} vol={v} mute={m}")
+                            _soco = self.soco_by_ip.get(_ip) or SoCo(_ip)
+                            try:
+                                snap = Snapshot(_soco)
+                                snap.snapshot()
+                            except Exception as snap_error:
+                                self.logger.debug(
+                                    f"[ANNOUNCE SNAP] full snapshot failed for {_dev.name} "
+                                    f"({snap_error}) — capturing volume/mute only")
+                                snap = _VolumeOnlySnap(_soco)
+                            # Never restore a leftover announcement URL from a previous
+                            # run (mirrors the legacy flow's "announcement." guard).
+                            if "/announcement." in str(getattr(snap, "media_uri", "") or ""):
+                                snap.media_uri = ""
+                            # Record the zone's ORIGINAL coordinator so restore can
+                            # rebuild the exact pre-announcement grouping — and, when
+                            # this zone coordinates a group, any members OUTSIDE the
+                            # announcement (they get orphaned into a remnant group
+                            # when the coordinator is pulled away).
+                            orig_coord = None
+                            orig_members = []
+                            try:
+                                grp = _soco.group
+                                grp_coord = getattr(grp, "coordinator", None) if grp else None
+                                if grp_coord is not None and \
+                                        getattr(grp_coord, "uid", None) != getattr(_soco, "uid", None):
+                                    orig_coord = grp_coord
+                                elif grp is not None:
+                                    for m in list(getattr(grp, "members", []) or []):
+                                        try:
+                                            if getattr(m, "uid", None) != getattr(_soco, "uid", None) \
+                                                    and (m.ip_address or "").strip() not in ann_ips:
+                                                orig_members.append(m)
+                                        except Exception:
+                                            continue
+                            except Exception as topo_error:
+                                self.logger.debug(f"[ANNOUNCE SNAP] group lookup failed for {_dev.name}: {topo_error}")
+                            announce_snapshots.append((_dev, snap, _soco, orig_coord, orig_members))
+                            self.logger.debug(
+                                f"[ANNOUNCE SNAP] captured {_dev.name}"
+                                + (f" (slave of {getattr(orig_coord, 'player_name', '?')})" if orig_coord
+                                   else f" (coordinator/standalone, outside members: {len(orig_members)})"))
                         except Exception as e:
-                            self.logger.debug(f"[ANNOUNCE SAVE] capture failed for device {item}: {e}")
-                    self.logger.debug(f"[ANNOUNCE SAVE] per-device volumes/mutes captured: {snap_cnt} → "
-                                      f"{prev['per_dev_vol']} / {prev['per_dev_mute']}")
-                else:
-                    # Group snapshot (coordinator only)
+                            self.logger.warning(f"[ANNOUNCE SNAP] snapshot failed for zone {item}: {e}")
+                    if not announce_snapshots:
+                        self.logger.warning("[ANNOUNCE SNAP] no snapshots captured — using legacy save/restore")
+                        use_snapshot = False
+                except Exception as e:
+                    self.logger.warning(f"[ANNOUNCE SNAP] SoCo snapshot unavailable — using legacy save/restore: {e}")
+                    use_snapshot = False
+                    announce_snapshots = []
+
+            # ===== legacy state capture (only when SoCo Snapshot is off/failed) =====
+            if not use_snapshot:
+                # --- capture current playback state for quick restore (target device only) ---
+                prev = {
+                    "uri": "", "meta": "", "pos": "00:00:00", "vol": None,
+                    "state": "UNKNOWN",             # NEW: transport state
+                    "mute": None,                   # NEW: device mute (0/1)
+                    "per_dev_vol": {}, "per_dev_mute": {},  # NEW: per-device mutes
+                    "group_vol": None, "group_mute": None   # existing + group mute now meaningful
+                }
+                try:
+                    self.logger.debug(f"[ANNOUNCE SAVE] snapshot begin for {GM.name} @ {zoneIP}")
+                    mi = self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "GetMediaInfo", "")
+                    prev["meta"] = self.parseDirty(mi, "<CurrentURIMetaData>", "</CurrentURIMetaData>") or ""
+                    prev["uri"]  = self.parseDirty(mi, "<CurrentURI>", "</CurrentURI>") or ""
+                    pi = self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "GetPositionInfo", "")
                     try:
-                        gv = self.SOAPSend(zoneIP, "/MediaRenderer", "/GroupRenderingControl", "GetGroupVolume", "")
-                        prev["group_vol"] = _as_int(self.parseCurrentVolume(gv))
+                        prev["pos"] = self.parseRelTime(GM, pi) or "00:00:00"
                     except Exception as e:
-                        self.logger.debug(f"[ANNOUNCE SAVE] GetGroupVolume failed: {e}")
-                        prev["group_vol"] = None
+                        self.logger.debug(f"[ANNOUNCE SAVE] parseRelTime failed: {e}")
+                        try:
+                            rel = self.parseDirty(pi, "<RelTime>", "</RelTime>") or ""
+                            prev["pos"] = rel if rel.count(":") == 2 else "00:00:00"
+                        except Exception:
+                            prev["pos"] = "00:00:00"
+
+                    # NEW: Transport state (PLAYING/PAUSED_PLAYBACK/STOPPED)
                     try:
-                        gm = self.SOAPSend(zoneIP, "/MediaRenderer", "/GroupRenderingControl", "GetGroupMute", "")
-                        prev["group_mute"] = _as_int(self.parseCurrentMute(gm))
+                        ti = self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "GetTransportInfo", "")
+                        prev["state"] = (self.parseDirty(ti, "<CurrentTransportState>", "</CurrentTransportState>") or "UNKNOWN").strip()
                     except Exception as e:
-                        self.logger.debug(f"[ANNOUNCE SAVE] GetGroupMute failed: {e}")
-                        prev["group_mute"] = None
-                    self.logger.debug(f"[ANNOUNCE SAVE] group_vol={prev['group_vol']} group_mute={prev['group_mute']}")
-            except Exception as e:
-                self.logger.debug(f"[ANNOUNCE SAVE] Volume/mute snapshot failed (continuing): {e}")
+                        self.logger.debug(f"[ANNOUNCE SAVE] GetTransportInfo failed: {e}")
+
+                    # Volume + mute on target device
+                    try:
+                        gv = self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "GetVolume",
+                                           "<Channel>Master</Channel>")
+                        prev["vol"] = _as_int(self.parseCurrentVolume(gv))
+                    except Exception as e:
+                        self.logger.debug(f"[ANNOUNCE SAVE] GetVolume failed: {e}")
+                        prev["vol"] = None
+
+                    # NEW: device mute
+                    try:
+                        gm_xml = self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "GetMute",
+                                               "<Channel>Master</Channel>")
+                        prev["mute"] = _as_int(self.parseCurrentMute(gm_xml))  # expect 0/1
+                    except Exception as e:
+                        self.logger.debug(f"[ANNOUNCE SAVE] GetMute failed: {e}")
+                        prev["mute"] = None
+
+                    self.logger.debug(f"[ANNOUNCE SAVE] uri={prev['uri']!r} pos={prev['pos']} vol={prev['vol']} "
+                                      f"state={prev['state']} mute={prev['mute']}")
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Failed to snapshot current state prior to announcement: {e}")
+
+                # --- capture volumes/mutes we will overwrite (per-device or group) ---
+                try:
+                    if gc_only is False:
+                        # Per-device snapshot
+                        snap_cnt = 0
+                        for item in AnnouncementZones:
+                            try:
+                                _dev = indigo.devices[int(item)]
+                                _ip = (_dev.pluginProps.get("address") or _dev.address or "").strip()
+                                if not _ip:
+                                    self.logger.debug(f"[ANNOUNCE SAVE] skip {_dev.name}: no IP")
+                                    continue
+                                # volume
+                                gv = self.SOAPSend(_ip, "/MediaRenderer", "/RenderingControl", "GetVolume",
+                                                   "<Channel>Master</Channel>")
+                                v_raw = self.parseCurrentVolume(gv)
+                                v = _as_int(v_raw)
+                                prev["per_dev_vol"][_dev.id] = v
+                                # NEW: mute
+                                gm_xml = self.SOAPSend(_ip, "/MediaRenderer", "/RenderingControl", "GetMute",
+                                                       "<Channel>Master</Channel>")
+                                m = _as_int(self.parseCurrentMute(gm_xml))
+                                prev["per_dev_mute"][_dev.id] = m
+                                snap_cnt += 1
+                                self.logger.debug(f"[ANNOUNCE SAVE] captured {_dev.name} vol={v} mute={m}")
+                            except Exception as e:
+                                self.logger.debug(f"[ANNOUNCE SAVE] capture failed for device {item}: {e}")
+                        self.logger.debug(f"[ANNOUNCE SAVE] per-device volumes/mutes captured: {snap_cnt} → "
+                                          f"{prev['per_dev_vol']} / {prev['per_dev_mute']}")
+                    else:
+                        # Group snapshot (coordinator only)
+                        try:
+                            gv = self.SOAPSend(zoneIP, "/MediaRenderer", "/GroupRenderingControl", "GetGroupVolume", "")
+                            prev["group_vol"] = _as_int(self.parseCurrentVolume(gv))
+                        except Exception as e:
+                            self.logger.debug(f"[ANNOUNCE SAVE] GetGroupVolume failed: {e}")
+                            prev["group_vol"] = None
+                        try:
+                            gm = self.SOAPSend(zoneIP, "/MediaRenderer", "/GroupRenderingControl", "GetGroupMute", "")
+                            prev["group_mute"] = _as_int(self.parseCurrentMute(gm))
+                        except Exception as e:
+                            self.logger.debug(f"[ANNOUNCE SAVE] GetGroupMute failed: {e}")
+                            prev["group_mute"] = None
+                        self.logger.debug(f"[ANNOUNCE SAVE] group_vol={prev['group_vol']} group_mute={prev['group_mute']}")
+                except Exception as e:
+                    self.logger.debug(f"[ANNOUNCE SAVE] Volume/mute snapshot failed (continuing): {e}")
 
             self.logger.debug("[ANNOUNCE STEP] snapshot complete; entering (re)group")
 
@@ -5872,12 +6038,14 @@ class SonosPlugin(object):
                         self.actionDirect(PA(dev.id), "setStandalone")
 
                     # add announcement zones to group (ensure 'setting' is a string)
+                    # addPlayerToZone semantics: bound device = JOINER, 'setting' = COORDINATOR,
+                    # so each additional zone joins GM's group (GM stays coordinator).
                     self.plugin.debugLog("Announcement: add announcement zones to group")
                     itemcount = 0
                     for item in AnnouncementZones:
                         dev = indigo.devices[int(item)]
                         if itemcount > 0:
-                            self.actionDirect(PA(GM.id, {'setting': str(dev.id)}), "addPlayerToZone")
+                            self.actionDirect(PA(dev.id, {'setting': str(GM.id)}), "addPlayerToZone")
                         itemcount += 1
                 else:
                     # Nothing to split here; just ensure transport is stopped on GM
@@ -5929,9 +6097,11 @@ class SonosPlugin(object):
             while count < 5 and success == 0:
                 try:
                     if "mp3" in s_announcement:
-                        audio = MP3("./" + s_announcement)
+                        audio = MP3(os.path.join(announce_root, s_announcement))
+                    elif "wav" in s_announcement:
+                        audio = WAVE(os.path.join(announce_root, s_announcement))
                     elif "aiff" in s_announcement:
-                        audio = AIFF("./" + s_announcement)
+                        audio = AIFF(os.path.join(announce_root, s_announcement))
                     success = 1
                 except Exception as e:
                     self.logger.debug(f"[ANNOUNCE] audio probe failed (try {count+1}/5): {e}")
@@ -5992,6 +6162,7 @@ class SonosPlugin(object):
                         f"<CurrentURIMetaData></CurrentURIMetaData>"
                     )
                     self.logger.info(f"[ANNOUNCE URI] {announcement_uri}")
+                    uri_set_time = time.time()
                     self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "SetAVTransportURI", soap_payload)
 
                 except Exception as e:
@@ -6009,116 +6180,134 @@ class SonosPlugin(object):
                 # Play announcement
                 self.logger.debug("[ANNOUNCE] Play announcement")
                 self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Play", "<Speed>1</Speed>")
-                self.plugin.sleep(tts_delay + audio.info.length)
+
+                # Fetch watchdog: the player must PULL the file from our HTTP
+                # server. If no request has arrived a couple of seconds after
+                # Play, nothing will ever sound (player sits in TRANSITIONING) —
+                # almost always a firewall/VLAN rule blocking speaker → server.
+                # Diagnose loudly instead of failing silently.
+                total_wait = tts_delay + audio.info.length
+                self.plugin.sleep(min(2.0, total_wait))
+                fetches = getattr(self, "_announce_last_fetch", {}) or {}
+                if fetches.get(zoneIP, 0.0) < uri_set_time:
+                    self.logger.error(
+                        f"❌ {GM.name} never fetched the announcement from {announcement_uri} — "
+                        f"the player cannot reach this Mac on port {http_port}. Check that your "
+                        f"firewall/VLAN rules allow {zoneIP} → {http_server}:{http_port}/tcp.")
+                if total_wait > 2.0:
+                    self.plugin.sleep(total_wait - 2.0)
 
                 # --- restore previous playback (best-effort) ---
-                try:
-                    self.logger.debug(f"[ANNOUNCE RESTORE] begin; gc_only={gc_only} "
-                                      f"dev_vols={prev.get('per_dev_vol')} group_vol={prev.get('group_vol')} "
-                                      f"uri={prev.get('uri')!r} pos={prev.get('pos')} vol={prev.get('vol')} "
-                                      f"state={prev.get('state')} mute={prev.get('mute')}")
+                if use_snapshot:
+                    self._restore_announcement_snapshots(announce_snapshots)
+                else:
+                    try:
+                        self.logger.debug(f"[ANNOUNCE RESTORE] begin; gc_only={gc_only} "
+                                          f"dev_vols={prev.get('per_dev_vol')} group_vol={prev.get('group_vol')} "
+                                          f"uri={prev.get('uri')!r} pos={prev.get('pos')} vol={prev.get('vol')} "
+                                          f"state={prev.get('state')} mute={prev.get('mute')}")
 
-                    had_prior_uri = bool(prev.get("uri")) and "announcement." not in (prev.get("uri") or "")
+                        had_prior_uri = bool(prev.get("uri")) and "announcement." not in (prev.get("uri") or "")
 
-                    if had_prior_uri:
-                        restore_payload = (f"<CurrentURI>{prev['uri']}</CurrentURI>"
-                                           f"<CurrentURIMetaData>{prev['meta']}</CurrentURIMetaData>")
-                        self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "SetAVTransportURI", restore_payload)
-                        self.plugin.sleep(0.3)  # settle
+                        if had_prior_uri:
+                            restore_payload = (f"<CurrentURI>{prev['uri']}</CurrentURI>"
+                                               f"<CurrentURIMetaData>{prev['meta']}</CurrentURIMetaData>")
+                            self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "SetAVTransportURI", restore_payload)
+                            self.plugin.sleep(0.3)  # settle
 
-                        if prev.get("pos") and prev["pos"].count(":") == 2 and prev["pos"] != "00:00:00":
-                            try:
-                                self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Seek",
-                                              f"<Unit>REL_TIME</Unit><Target>{prev['pos']}</Target>")
-                                self.logger.debug(f"[ANNOUNCE RESTORE] Seek to {prev['pos']}")
-                            except Exception as e:
-                                self.logger.debug(f"[ANNOUNCE RESTORE] Seek failed (continuing): {e}")
-                    else:
-                        self.logger.debug("[ANNOUNCE RESTORE] No prior URI captured; skipping URI restore")
-
-                    # ========== RESTORE VOLUME + MUTE EXACTLY ==========
-                    if gc_only:
-                        restore_gv = prev.get("group_vol")
-                        if isinstance(restore_gv, int):
-                            try:
-                                self.logger.debug(f"[ANNOUNCE RESTORE] Restoring GROUP volume → {restore_gv}")
-                                self.SOAPSend(zoneIP, "/MediaRenderer", "/GroupRenderingControl", "SetGroupVolume",
-                                              f"<DesiredVolume>{restore_gv}</DesiredVolume>")
-                            except Exception as e:
-                                self.logger.debug(f"[ANNOUNCE RESTORE] Group volume restore failed: {e}")
-                        if prev.get("group_mute") in (0, 1):
-                            try:
-                                self.logger.debug(f"[ANNOUNCE RESTORE] Restoring GROUP mute → {prev['group_mute']}")
-                                self.SOAPSend(zoneIP, "/MediaRenderer", "/GroupRenderingControl", "SetGroupMute",
-                                              f"<DesiredMute>{prev['group_mute']}</DesiredMute>")
-                            except Exception as e:
-                                self.logger.debug(f"[ANNOUNCE RESTORE] Group mute restore failed: {e}")
-                    else:
-                        for item in AnnouncementZones:
-                            try:
-                                _dev = indigo.devices[int(item)]
-                                _ip = (_dev.pluginProps.get("address") or _dev.address or "").strip()
-                                if not _ip:
-                                    continue
-                                pv = prev["per_dev_vol"].get(_dev.id, None)
-                                pm = prev["per_dev_mute"].get(_dev.id, None)
-                                if isinstance(pv, int):
-                                    self.logger.debug(f"[ANNOUNCE RESTORE] { _dev.name } volume → {pv}")
-                                    self.SOAPSend(_ip, "/MediaRenderer", "/RenderingControl", "SetVolume",
-                                                  f"<Channel>Master</Channel><DesiredVolume>{pv}</DesiredVolume>")
-                                if pm in (0, 1):
-                                    self.logger.debug(f"[ANNOUNCE RESTORE] { _dev.name } mute → {pm}")
-                                    self.SOAPSend(_ip, "/MediaRenderer", "/RenderingControl", "SetMute",
-                                                  f"<Channel>Master</Channel><DesiredMute>{pm}</DesiredMute>")
-                            except Exception as e:
-                                self.logger.debug(f"[ANNOUNCE RESTORE] per-device restore failed for {item}: {e}")
-
-                        if isinstance(prev.get("vol"), int):
-                            try:
-                                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetVolume",
-                                              f"<Channel>Master</Channel><DesiredVolume>{prev['vol']}</DesiredVolume>")
-                            except Exception:
-                                pass
-                        if prev.get("mute") in (0, 1):
-                            try:
-                                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetMute",
-                                              f"<Channel>Master</Channel><DesiredMute>{prev['mute']}</DesiredMute>")
-                            except Exception:
-                                pass
-                    # ========== /RESTORE VOLUME + MUTE EXACTLY ==========
-
-                    # Only resume transport to the *previous* state
-                    state = (prev.get("state") or "UNKNOWN").upper()
-                    if had_prior_uri:
-                        if state == "PLAYING":
-                            self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Play", "<Speed>1</Speed>")
-                            self.logger.debug("[ANNOUNCE RESTORE] Resumed PLAYING")
-                        elif state in ("PAUSED_PLAYBACK", "PAUSED"):
-                            try:
-                                self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Pause", "")
-                                self.logger.debug("[ANNOUNCE RESTORE] Restored PAUSED")
-                            except Exception:
+                            if prev.get("pos") and prev["pos"].count(":") == 2 and prev["pos"] != "00:00:00":
                                 try:
-                                    self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Play", "<Speed>1</Speed>")
-                                    self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Pause", "")
-                                    self.logger.debug("[ANNOUNCE RESTORE] Pause via Play→Pause fallback")
+                                    self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Seek",
+                                                  f"<Unit>REL_TIME</Unit><Target>{prev['pos']}</Target>")
+                                    self.logger.debug(f"[ANNOUNCE RESTORE] Seek to {prev['pos']}")
                                 except Exception as e:
-                                    self.logger.debug(f"[ANNOUNCE RESTORE] Pause fallback failed: {e}")
-                        elif state == "STOPPED":
+                                    self.logger.debug(f"[ANNOUNCE RESTORE] Seek failed (continuing): {e}")
+                        else:
+                            self.logger.debug("[ANNOUNCE RESTORE] No prior URI captured; skipping URI restore")
+
+                        # ========== RESTORE VOLUME + MUTE EXACTLY ==========
+                        if gc_only:
+                            restore_gv = prev.get("group_vol")
+                            if isinstance(restore_gv, int):
+                                try:
+                                    self.logger.debug(f"[ANNOUNCE RESTORE] Restoring GROUP volume → {restore_gv}")
+                                    self.SOAPSend(zoneIP, "/MediaRenderer", "/GroupRenderingControl", "SetGroupVolume",
+                                                  f"<DesiredVolume>{restore_gv}</DesiredVolume>")
+                                except Exception as e:
+                                    self.logger.debug(f"[ANNOUNCE RESTORE] Group volume restore failed: {e}")
+                            if prev.get("group_mute") in (0, 1):
+                                try:
+                                    self.logger.debug(f"[ANNOUNCE RESTORE] Restoring GROUP mute → {prev['group_mute']}")
+                                    self.SOAPSend(zoneIP, "/MediaRenderer", "/GroupRenderingControl", "SetGroupMute",
+                                                  f"<DesiredMute>{prev['group_mute']}</DesiredMute>")
+                                except Exception as e:
+                                    self.logger.debug(f"[ANNOUNCE RESTORE] Group mute restore failed: {e}")
+                        else:
+                            for item in AnnouncementZones:
+                                try:
+                                    _dev = indigo.devices[int(item)]
+                                    _ip = (_dev.pluginProps.get("address") or _dev.address or "").strip()
+                                    if not _ip:
+                                        continue
+                                    pv = prev["per_dev_vol"].get(_dev.id, None)
+                                    pm = prev["per_dev_mute"].get(_dev.id, None)
+                                    if isinstance(pv, int):
+                                        self.logger.debug(f"[ANNOUNCE RESTORE] { _dev.name } volume → {pv}")
+                                        self.SOAPSend(_ip, "/MediaRenderer", "/RenderingControl", "SetVolume",
+                                                      f"<Channel>Master</Channel><DesiredVolume>{pv}</DesiredVolume>")
+                                    if pm in (0, 1):
+                                        self.logger.debug(f"[ANNOUNCE RESTORE] { _dev.name } mute → {pm}")
+                                        self.SOAPSend(_ip, "/MediaRenderer", "/RenderingControl", "SetMute",
+                                                      f"<Channel>Master</Channel><DesiredMute>{pm}</DesiredMute>")
+                                except Exception as e:
+                                    self.logger.debug(f"[ANNOUNCE RESTORE] per-device restore failed for {item}: {e}")
+
+                            if isinstance(prev.get("vol"), int):
+                                try:
+                                    self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetVolume",
+                                                  f"<Channel>Master</Channel><DesiredVolume>{prev['vol']}</DesiredVolume>")
+                                except Exception:
+                                    pass
+                            if prev.get("mute") in (0, 1):
+                                try:
+                                    self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetMute",
+                                                  f"<Channel>Master</Channel><DesiredMute>{prev['mute']}</DesiredMute>")
+                                except Exception:
+                                    pass
+                        # ========== /RESTORE VOLUME + MUTE EXACTLY ==========
+
+                        # Only resume transport to the *previous* state
+                        state = (prev.get("state") or "UNKNOWN").upper()
+                        if had_prior_uri:
+                            if state == "PLAYING":
+                                self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Play", "<Speed>1</Speed>")
+                                self.logger.debug("[ANNOUNCE RESTORE] Resumed PLAYING")
+                            elif state in ("PAUSED_PLAYBACK", "PAUSED"):
+                                try:
+                                    self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Pause", "")
+                                    self.logger.debug("[ANNOUNCE RESTORE] Restored PAUSED")
+                                except Exception:
+                                    try:
+                                        self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Play", "<Speed>1</Speed>")
+                                        self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Pause", "")
+                                        self.logger.debug("[ANNOUNCE RESTORE] Pause via Play→Pause fallback")
+                                    except Exception as e:
+                                        self.logger.debug(f"[ANNOUNCE RESTORE] Pause fallback failed: {e}")
+                            elif state == "STOPPED":
+                                try:
+                                    self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Stop", "")
+                                    self.logger.debug("[ANNOUNCE RESTORE] Restored STOPPED")
+                                except Exception as e:
+                                    self.logger.debug(f"[ANNOUNCE RESTORE] Stop failed: {e}")
+                        else:
                             try:
                                 self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Stop", "")
-                                self.logger.debug("[ANNOUNCE RESTORE] Restored STOPPED")
-                            except Exception as e:
-                                self.logger.debug(f"[ANNOUNCE RESTORE] Stop failed: {e}")
-                    else:
-                        try:
-                            self.SOAPSend(zoneIP, "/MediaRenderer", "/AVTransport", "Stop", "")
-                            self.logger.debug("[ANNOUNCE RESTORE] No prior URI → STOP")
-                        except Exception:
-                            pass
+                                self.logger.debug("[ANNOUNCE RESTORE] No prior URI → STOP")
+                            except Exception:
+                                pass
 
-                except Exception as e:
-                    self.logger.warning(f"⚠️ Failed to restore previous playback after announcement: {e}")
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ Failed to restore previous playback after announcement: {e}")
             else:
                 self.plugin.errorLog("Unable to read MP3/AIFF file. Announcement aborted.")
 
@@ -6134,7 +6323,7 @@ class SonosPlugin(object):
         grantType = 'client_credentials'
 
         postdata = {'grant_type':grantType, 'scope':scopeUrl, 'client_id':self.MSTranslateClientID, 'client_secret':self.MSTranslateClientSecret}
-        response = requests.post(authUrl, data=postdata)
+        response = requests.post(authUrl, data=postdata, timeout=15)
 
         if response.status_code == 200:
             content = json.loads (response.content)
@@ -6151,7 +6340,7 @@ class SonosPlugin(object):
         scopeUrl = 'http://api.microsofttranslator.com'
         headers = {'Content-Type':'text/xml', 'Authorization':'Bearer ' + accessToken}
         url = scopeUrl + '/V2/Http.svc/GetLanguagesForSpeak'
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=15)
 
         langCodes = []
         Languages = ET.fromstring(response.content)
@@ -6164,14 +6353,14 @@ class SonosPlugin(object):
         self.myLocale = 'en'
 
         url = scopeUrl + '/V2/Ajax.svc/GetLanguageNames?locale=' + self.myLocale + '&languageCodes=' + languageCodes
-        response = requests.post(url, headers=headers)
+        response = requests.post(url, headers=headers, timeout=15)
 
         name_code = dict(zip(langCodes, eval(response.content)))
         indigo.server.log("Loaded Microsoft Translate Voices... [%s]" % len(name_code))
 
         return (name_code)
 
-    def MicrosoftTranslate(self, announcement, language):
+    def MicrosoftTranslate(self, announcement, language, out_path='announcement.mp3'):
         authUrl = 'https://datamarket.accesscontrol.windows.net/v2/OAuth2-13/'
         scopeUrl = 'http://api.microsofttranslator.com'
         speakUrl = 'http://api.microsofttranslator.com/V2/Http.svc/Speak'
@@ -6184,8 +6373,8 @@ class SonosPlugin(object):
         headers = {'Content-Type':'audio/mp3', 'Authorization':'Bearer ' + accessToken}
         url = speakUrl + '?text=' + announcement + '&language=' + language + '&format=audio/mp3&options=MaxQuality'
 
-        with open ('announcement.mp3', 'wb') as handle:
-            response = requests.get(url, headers=headers, stream=True)
+        with open (out_path, 'wb') as handle:
+            response = requests.get(url, headers=headers, stream=True, timeout=15)
 
             if response.ok:
                 for block in response.iter_content(1024):
@@ -6319,92 +6508,102 @@ class SonosPlugin(object):
 
 
 
-                try:
-                    if (self.Pandora != self.plugin.pluginPrefs['Pandora']) or \
-                            (self.PandoraEmailAddress != self.plugin.pluginPrefs['PandoraEmailAddress']) or \
-                            (self.PandoraPassword != self.plugin.pluginPrefs['PandoraPassword']) or \
-                            (self.PandoraNickname != self.plugin.pluginPrefs['PandoraNickname']):
-                        self.Pandora = self.plugin.pluginPrefs['Pandora']
-                        self.PandoraEmailAddress = self.plugin.pluginPrefs['PandoraEmailAddress']
-                        self.PandoraPassword = self.plugin.pluginPrefs['PandoraPassword']
-                        self.PandoraNickname = self.plugin.pluginPrefs['PandoraNickname']
-                        if self.Pandora:
-                            self.getPandora(self.PandoraEmailAddress, self.PandoraPassword, self.PandoraNickname)
-                except Exception as exception_error:
-                    self.logger.error(f"[{time.asctime()}] Could not retrieve Pandora credentials.")
-
-                try:
-                    if (self.Pandora2 != self.plugin.pluginPrefs['Pandora2']) or \
-                            (self.PandoraEmailAddress2 != self.plugin.pluginPrefs['PandoraEmailAddress2']) or \
-                            (self.PandoraPassword2 != self.plugin.pluginPrefs['PandoraPassword2']) or \
-                            (self.PandoraNickname2 != self.plugin.pluginPrefs['PandoraNickname2']):
-                        self.Pandora2 = self.plugin.pluginPrefs['Pandora2']
-                        self.PandoraEmailAddress2 = self.plugin.pluginPrefs['PandoraEmailAddress2']
-                        self.PandoraPassword2 = self.plugin.pluginPrefs['PandoraPassword2']
-                        self.PandoraNickname2 = self.plugin.pluginPrefs['PandoraNickname2']
-                        if self.Pandora2:
-                            self.getPandora(self.PandoraEmailAddress2, self.PandoraPassword2, self.PandoraNickname2)
-                except Exception as exception_error:
-                    self.logger.error(f"[{time.asctime()}] Could not retrieve secondary Pandora credentials.")
-
-                try:
-                    if (self.SiriusXM != self.plugin.pluginPrefs['SiriusXM']) or \
-                            (self.SiriusXMID != self.plugin.pluginPrefs['SiriusXMID']) or \
-                            (self.SiriusXMPassword != self.plugin.pluginPrefs['SiriusXMPassword']):
-                        self.SiriusXM = self.plugin.pluginPrefs['SiriusXM']
-                        self.SiriusXMID = self.plugin.pluginPrefs['SiriusXMID']
-                        self.SiriusXMPassword = self.plugin.pluginPrefs['SiriusXMPassword']
-                        if self.SiriusXM:
-                            self.getSiriusXM()
-                except Exception as exception_error:
-                    self.logger.error(f"[{time.asctime()}] Could not retrieve SiriusXM parameters.")
-
-                try:
-                    if (self.IVONA != self.plugin.pluginPrefs['IVONA']) or \
-                            (self.IVONAaccessKey != self.plugin.pluginPrefs['IVONAaccessKey']) or \
-                            (self.IVONAsecretKey != self.plugin.pluginPrefs['IVONAsecretKey']):
-                        self.IVONA = self.plugin.pluginPrefs['IVONA']
-                        if self.IVONA:
-                            self.IVONAaccessKey = self.plugin.pluginPrefs['IVONAaccessKey']
-                            self.IVONAsecretKey = self.plugin.pluginPrefs['IVONAsecretKey']
-                        if self.IVONA:
-                            self.IVONAVoices()
-                except Exception as exception_error:
-                    self.logger.error(f"[{time.asctime()}] Could not retrieve IVONA parameters.")
-
-                try:
-                    polly_pref   = self.plugin.pluginPrefs.get('Polly', False)
-                    polly_access = self.plugin.pluginPrefs.get('PollyaccessKey', '')
-                    polly_secret = self.plugin.pluginPrefs.get('PollysecretKey', '')
-                    if (self.Polly != polly_pref) or \
-                            (self.PollyaccessKey != polly_access) or \
-                            (self.PollysecretKey != polly_secret):
-                        self.Polly = polly_pref
-                        if self.Polly:
-                            self.PollyaccessKey = polly_access
-                            self.PollysecretKey = polly_secret
-                            self.PollyVoices()
-                except Exception as exception_error:
-                    self.logger.error(f"[{time.asctime()}] Could not retrieve Polly parameters: {exception_error}")
-
-                try:
-                    if (self.MSTranslate != self.plugin.pluginPrefs['MSTranslate']) or \
-                            (self.MSTranslateClientID != self.plugin.pluginPrefs['MSTranslateClientID']) or \
-                            (self.MSTranslateClientSecret != self.plugin.pluginPrefs['MSTranslateClientSecret']):
-                        self.MSTranslate = self.plugin.pluginPrefs['MSTranslate']
-                        if self.MSTranslate:
-                            self.MSTranslateClientID = self.plugin.pluginPrefs['MSTranslateClientID']
-                            self.MSTranslateClientSecret = self.plugin.pluginPrefs['MSTranslateClientSecret']
-                        if self.MSTranslate:
-                            self.MSTranslateVoices = self.MicrosoftTranslateLanguages()
-                except Exception as exception_error:
-                    self.logger.error(f"[{time.asctime()}] Could not retrieve MSTranslate parameters.")
+                self.processServicePrefs()
 
                 self.logger.info(f"[{time.asctime()}] Processed plugin preferences.")
                 return True
 
         except Exception as exception_error:
             self.exception_handler(exception_error, True)  # Log error and display failing statement
+
+    def processServicePrefs(self):
+        """Load/refresh streaming-service and TTS credentials from pluginPrefs.
+
+        Called from closedPrefsConfigUi and from startup() — the original plugin
+        loaded these at startup via closedPrefsConfigUi(None, None); without a
+        startup call the TTS keys stay None until the config dialog is re-saved
+        (e.g. Polly announcements fail with "Unable to locate credentials").
+        """
+        try:
+            if (self.Pandora != self.plugin.pluginPrefs['Pandora']) or \
+                    (self.PandoraEmailAddress != self.plugin.pluginPrefs['PandoraEmailAddress']) or \
+                    (self.PandoraPassword != self.plugin.pluginPrefs['PandoraPassword']) or \
+                    (self.PandoraNickname != self.plugin.pluginPrefs['PandoraNickname']):
+                self.Pandora = self.plugin.pluginPrefs['Pandora']
+                self.PandoraEmailAddress = self.plugin.pluginPrefs['PandoraEmailAddress']
+                self.PandoraPassword = self.plugin.pluginPrefs['PandoraPassword']
+                self.PandoraNickname = self.plugin.pluginPrefs['PandoraNickname']
+                if self.Pandora:
+                    self.getPandora(self.PandoraEmailAddress, self.PandoraPassword, self.PandoraNickname)
+        except Exception as exception_error:
+            self.logger.error(f"[{time.asctime()}] Could not retrieve Pandora credentials.")
+
+        try:
+            if (self.Pandora2 != self.plugin.pluginPrefs['Pandora2']) or \
+                    (self.PandoraEmailAddress2 != self.plugin.pluginPrefs['PandoraEmailAddress2']) or \
+                    (self.PandoraPassword2 != self.plugin.pluginPrefs['PandoraPassword2']) or \
+                    (self.PandoraNickname2 != self.plugin.pluginPrefs['PandoraNickname2']):
+                self.Pandora2 = self.plugin.pluginPrefs['Pandora2']
+                self.PandoraEmailAddress2 = self.plugin.pluginPrefs['PandoraEmailAddress2']
+                self.PandoraPassword2 = self.plugin.pluginPrefs['PandoraPassword2']
+                self.PandoraNickname2 = self.plugin.pluginPrefs['PandoraNickname2']
+                if self.Pandora2:
+                    self.getPandora(self.PandoraEmailAddress2, self.PandoraPassword2, self.PandoraNickname2)
+        except Exception as exception_error:
+            self.logger.error(f"[{time.asctime()}] Could not retrieve secondary Pandora credentials.")
+
+        try:
+            if (self.SiriusXM != self.plugin.pluginPrefs['SiriusXM']) or \
+                    (self.SiriusXMID != self.plugin.pluginPrefs['SiriusXMID']) or \
+                    (self.SiriusXMPassword != self.plugin.pluginPrefs['SiriusXMPassword']):
+                self.SiriusXM = self.plugin.pluginPrefs['SiriusXM']
+                self.SiriusXMID = self.plugin.pluginPrefs['SiriusXMID']
+                self.SiriusXMPassword = self.plugin.pluginPrefs['SiriusXMPassword']
+                if self.SiriusXM:
+                    self.getSiriusXM()
+        except Exception as exception_error:
+            self.logger.error(f"[{time.asctime()}] Could not retrieve SiriusXM parameters.")
+
+        try:
+            if (self.IVONA != self.plugin.pluginPrefs['IVONA']) or \
+                    (self.IVONAaccessKey != self.plugin.pluginPrefs['IVONAaccessKey']) or \
+                    (self.IVONAsecretKey != self.plugin.pluginPrefs['IVONAsecretKey']):
+                self.IVONA = self.plugin.pluginPrefs['IVONA']
+                if self.IVONA:
+                    self.IVONAaccessKey = self.plugin.pluginPrefs['IVONAaccessKey']
+                    self.IVONAsecretKey = self.plugin.pluginPrefs['IVONAsecretKey']
+                if self.IVONA:
+                    self.IVONAVoices()
+        except Exception as exception_error:
+            self.logger.error(f"[{time.asctime()}] Could not retrieve IVONA parameters.")
+
+        try:
+            polly_pref   = self.plugin.pluginPrefs.get('Polly', False)
+            polly_access = self.plugin.pluginPrefs.get('PollyaccessKey', '')
+            polly_secret = self.plugin.pluginPrefs.get('PollysecretKey', '')
+            if (self.Polly != polly_pref) or \
+                    (self.PollyaccessKey != polly_access) or \
+                    (self.PollysecretKey != polly_secret):
+                self.Polly = polly_pref
+                if self.Polly:
+                    self.PollyaccessKey = polly_access
+                    self.PollysecretKey = polly_secret
+                    self.PollyVoices()
+        except Exception as exception_error:
+            self.logger.error(f"[{time.asctime()}] Could not retrieve Polly parameters: {exception_error}")
+
+        try:
+            if (self.MSTranslate != self.plugin.pluginPrefs['MSTranslate']) or \
+                    (self.MSTranslateClientID != self.plugin.pluginPrefs['MSTranslateClientID']) or \
+                    (self.MSTranslateClientSecret != self.plugin.pluginPrefs['MSTranslateClientSecret']):
+                self.MSTranslate = self.plugin.pluginPrefs['MSTranslate']
+                if self.MSTranslate:
+                    self.MSTranslateClientID = self.plugin.pluginPrefs['MSTranslateClientID']
+                    self.MSTranslateClientSecret = self.plugin.pluginPrefs['MSTranslateClientSecret']
+                if self.MSTranslate:
+                    self.MSTranslateVoices = self.MicrosoftTranslateLanguages()
+        except Exception as exception_error:
+            self.logger.error(f"[{time.asctime()}] Could not retrieve MSTranslate parameters.")
 
 
 
@@ -6746,11 +6945,11 @@ class SonosPlugin(object):
 
         # check for sound file?
         self.SoundFilePath = self.pluginPrefs.get("SoundFilePath", "")
-        self.logger.warning(f"🔧 Loaded SoundFilePath from prefs: {self.SoundFilePath}")
+        self.logger.debug(f"🔧 Loaded SoundFilePath from prefs: {self.SoundFilePath}")
 
         if not self.SoundFilePath:
             self.SoundFilePath = indigo.server.getInstallFolderPath() + "/AudioFiles"
-            self.logger.warning(f"⚠️ Falling back to default SoundFilePath: {self.SoundFilePath}")
+            self.logger.info(f"⚠️ Falling back to default SoundFilePath: {self.SoundFilePath}")
 
         # Cleanup old art before starting the server to reduce storage size and keep things tidy
         self.cleanup_old_artwork()
@@ -6884,6 +7083,29 @@ class SonosPlugin(object):
         # 📥 Continue normal Sonos initialization
         # Split into smaller guarded sections so later steps still run.
 
+        # Load streaming-service/TTS credentials (Pandora, SiriusXM, IVONA, Polly,
+        # MSTranslate) from pluginPrefs — the original plugin did this at startup
+        # via closedPrefsConfigUi(None, None); without it Polly/IVONA keys remain
+        # None until the config dialog is re-saved.
+        try:
+            self.processServicePrefs()
+        except Exception as e:
+            self.logger.error(f"❌ Failed to load service credentials from prefs (continuing): {e}")
+
+        # Apple voices for the announcement UI — the original plugin loaded these
+        # at startup; without this the APPLE_voice menu is empty and Apple Speech
+        # announcements silently produce nothing.
+        try:
+            global NSVoices
+            NSVoices = NSSpeechSynthesizer.availableVoices()
+            self.logger.info(f"🗣️ Loaded Apple Voices.. [{len(NSVoices)}]")
+        except Exception as e:
+            self.logger.error(f"❌ Cannot load Apple Voices: {e}")
+
+        # One-time heads-up when players live on a different subnet/VLAN than
+        # this Mac — announcements and artwork are pulled BY the players FROM us.
+        self._log_cross_vlan_firewall_advice()
+
 
 
 
@@ -6954,8 +7176,8 @@ class SonosPlugin(object):
             self.logger.error(f"❌ Reference player setup failed: {e}")
 
         try:
-            self.logger.info("🕒 Deferring SiriusXM test playback for 'Office' until runConcurrentThread()")
-            self.logger.info("🔧 Starting up Sonos Plugin...")
+            self.logger.debug("🕒 Deferring SiriusXM test playback for 'Office' until runConcurrentThread()")
+            self.logger.debug("🔧 Starting up Sonos Plugin...")
             self.build_ip_to_device_map()
             self.logger.debug("🔎 Performing post-startup audit of Sonos device group states...")
         except Exception as e:
@@ -6971,7 +7193,7 @@ class SonosPlugin(object):
                 group_name = dev.states.get("GROUP_Name", "n/a")
                 Grouped = dev.states.get("Grouped", "n/a")
                 # NOTE: we now run evaluate/elevate AFTER bootstrap so we just log here.
-                self.logger.info(f"📊 Device '{dev.name}': Coordinator={group_coordinator}, Group='{group_name}', Grouped={Grouped}")
+                self.logger.debug(f"📊 Device '{dev.name}': Coordinator={group_coordinator}, Group='{group_name}', Grouped={Grouped}")
 
         except Exception as e:
             self.logger.error(f"❌ Per-device initialization loop failed (continuing): {e}")
@@ -7382,6 +7604,7 @@ class SonosPlugin(object):
         deferred = getattr(self, "deferred_start_devices", None)
         if not deferred:
             return
+        uid_to_ip = None  # lazy: at most one discovery sweep per retry pass
         for dev_id in list(deferred):
             try:
                 dev = indigo.devices[dev_id]
@@ -7398,12 +7621,178 @@ class SonosPlugin(object):
                     self.deviceStartComm(dev)
                 except Exception as e:
                     self.logger.error(f"❌ Deferred deviceStartComm failed for {dev.name}: {e}")
+                continue
+
+            # Configured IP still dead — but the IP is not the player's identity
+            # (forum t=28960): look for the same RINCON UID at a new address (DHCP
+            # move) and heal the stored address so the device recovers without the
+            # user deleting/recreating it or touching control pages.
+            uid = (dev.states.get("ZP_LocalUID") or "").strip()
+            if not uid:
+                continue
+            if uid_to_ip is None:
+                uid_to_ip = self._discover_uid_to_ip()
+            new_ip = uid_to_ip.get(uid, "")
+            if new_ip and new_ip != dev.address:
+                self.logger.info(
+                    f"🩹 {dev.name} answered discovery at {new_ip} (configured {dev.address}) — "
+                    f"updating device address; Indigo will restart the device.")
+                try:
+                    props = dev.pluginProps
+                    props["address"] = new_ip
+                    deferred.discard(dev_id)
+                    dev.replacePluginPropsOnServer(props)
+                except Exception as e:
+                    self.logger.error(f"❌ Could not update address for {dev.name}: {e}")
+
+    def _discover_uid_to_ip(self):
+        """One SSDP sweep mapping live players' RINCON UIDs → current IPs.
+
+        Used only from the deferred-retry path, throttled to one sweep per five
+        minutes so a long-term-offline player doesn't keep the network busy with
+        multicast discovery every 60s retry tick.
+        """
+        now = time.time()
+        if now - getattr(self, "_last_heal_discovery", 0.0) < 300.0:
+            return getattr(self, "_heal_uid_to_ip", {}) or {}
+        self._last_heal_discovery = now
+        mapping = {}
+        try:
+            found = soco.discover(timeout=5) or set()
+        except Exception as e:
+            self.logger.debug(f"self-heal discovery failed: {e}")
+            found = set()
+        for player in found:
+            try:
+                ip = player.ip_address
+                self.soco_by_ip[ip] = player
+                player_uid = self.safe_uid(ip, player)
+                if player_uid:
+                    mapping[player_uid] = ip
+            except Exception:
+                continue
+        self._heal_uid_to_ip = mapping
+        return mapping
+
+    def _log_cross_vlan_firewall_advice(self):
+        """Warn once at startup when Sonos players live on a different subnet.
+
+        Announcements (tcp/8889) and album art (tcp/8888) are PULLED by the
+        players from this Mac. A one-way LAN→VLAN firewall lets the plugin
+        control players fine while their fetches back to us are silently
+        dropped — announcements produce no audio (player stuck TRANSITIONING)
+        and artwork stays blank. Uses a /24 heuristic, good enough for advice.
+        """
+        try:
+            host = (getattr(self, "HTTPServer", "") or "").strip()
+            if not host or host.count(".") != 3:
+                return
+            host_net = host.rsplit(".", 1)[0]
+            announce_port = (getattr(self, "_announce_http_port", None)
+                             or getattr(self, "HTTPStreamingPort", None) or 8889)
+            other_nets = set()
+            for dev in indigo.devices.iter("com.ssi.indigoplugin.Sonos"):
+                ip = (dev.pluginProps.get("address") or dev.address or "").strip()
+                if ip and ip.count(".") == 3 and ip.rsplit(".", 1)[0] != host_net:
+                    other_nets.add(ip.rsplit(".", 1)[0] + ".0/24")
+            if other_nets:
+                nets = ", ".join(sorted(other_nets))
+                self.logger.warning(
+                    f"🧱 Sonos players found on {nets} — a different subnet/VLAN than this Mac ({host}). "
+                    f"Announcements, album art AND event notifications all travel FROM the players TO "
+                    f"this Mac, so your router/firewall must allow {nets} → {host} on "
+                    f"tcp/{announce_port} (announcements), tcp/8888 (album art) and tcp/1400 "
+                    f"(Sonos event notifications). Without tcp/1400 the players' state/group change "
+                    f"events never arrive — subscriptions look confirmed but the plugin goes blind and "
+                    f"group/playback states go stale, even though normal control keeps working.")
+        except Exception as e:
+            self.logger.debug(f"cross-VLAN advice check failed: {e}")
+
+    def _restore_announcement_snapshots(self, announce_snapshots):
+        """Restore group topology AND player state captured before an announcement.
+
+        Phase 1 rebuilds the ORIGINAL grouping (soco Snapshot alone never does
+        this — HA does it in its own speaker layer): zones that were slaves
+        re-join their old coordinator, zones that were standalone leave the
+        temporary announcement group. Phase 2 restores the soco Snapshots —
+        full transport (URI/queue/position, resumes if it was playing) for
+        original coordinators/standalone players, volume/mute for original
+        slaves (their audio follows their re-joined coordinator).
+        """
+        # Phase 1 — rebuild original grouping.
+        # Iterate REVERSED so temp-group members leave before the temp
+        # coordinator (announce_snapshots is in AnnouncementZones order, GM
+        # first). Do NOT consult soco's is_coordinator here: its cached topology
+        # can lag the announcement regrouping and skip the unjoin entirely —
+        # seen live: zones stayed grouped, then Phase 2 got UPnP 701 trying to
+        # pause a still-slaved player. We put these zones into the temp group,
+        # so unconditionally take them out; unjoin on an already-standalone
+        # player is a harmless no-op.
+        for _dev, snap, _soco, orig_coord, orig_members in reversed(announce_snapshots):
+            try:
+                if orig_coord is not None:
+                    _soco.join(orig_coord)
+                    self.logger.debug(
+                        f"[ANNOUNCE SNAP] {_dev.name} re-joined its original group "
+                        f"(coordinator {getattr(orig_coord, 'player_name', '?')})")
+                else:
+                    _soco.unjoin()
+                    self.logger.debug(f"[ANNOUNCE SNAP] {_dev.name} standalone again (as before announcement)")
+            except Exception as e:
+                self.logger.warning(f"[ANNOUNCE SNAP] regroup failed for {_dev.name}: {e}")
+
+        # Phase 1.5 — merge back ORIGINAL group members that were outside the
+        # announcement: when their coordinator was pulled into the temp group,
+        # Sonos re-formed them under an elected coordinator; re-join them so
+        # the original group comes back exactly as it was.
+        for _dev, snap, _soco, orig_coord, orig_members in announce_snapshots:
+            for m in (orig_members or []):
+                try:
+                    m.join(_soco)
+                    self.logger.debug(
+                        f"[ANNOUNCE SNAP] {getattr(m, 'player_name', '?')} re-joined "
+                        f"{_dev.name}'s restored group")
+                except Exception as e:
+                    self.logger.warning(
+                        f"[ANNOUNCE SNAP] could not re-join {getattr(m, 'player_name', '?')} "
+                        f"to {_dev.name}: {e}")
+
+        # Let the topology settle before touching transports
+        try:
+            self.plugin.sleep(1.0)
+        except Exception:
+            time.sleep(1.0)
+
+        # Phase 2 — player state; original coordinators/standalone first so their
+        # streams are re-established before slave volume restores.
+        ordered = sorted(announce_snapshots, key=lambda t: t[3] is not None)
+        for _dev, snap, _soco, orig_coord, orig_members in ordered:
+            try:
+                snap.restore(fade=False)
+                self.logger.debug(f"[ANNOUNCE SNAP] restored {_dev.name}")
+            except Exception as e:
+                self.logger.warning(f"[ANNOUNCE SNAP] restore failed for {_dev.name}: {e}")
+
+        # Phase 3 — resync plugin group caches from LIVE topology. The temp
+        # announcement group primed zone_group_state_cache and
+        # evaluated_group_members_by_coordinator (addPlayerToZone snap-priming),
+        # and soco's own group view can be frozen when event NOTIFYs can't reach
+        # us (one-way VLAN firewall) — without a forced live /status/zp refresh
+        # those ghosts keep resurrecting "grouped" device states after the
+        # players are actually standalone again.
+        try:
+            self._last_topology_refresh = 0.0  # beat the 3s debounce
+            self.evaluated_group_members_by_coordinator = {}
+            self.refresh_group_topology_after_plugin_zone_change()
+            self.logger.debug("[ANNOUNCE SNAP] post-restore live topology resync complete")
+        except Exception as e:
+            self.logger.debug(f"[ANNOUNCE SNAP] post-restore topology resync failed: {e}")
 
     def deviceStartComm(self, indigo_device):
         #self.logger.debug(f"🧪 deviceStartComm CALLED for {indigo_device.name}")
 
         try:
-            self.logger.info(f"🔌 Starting communication with Indigo device {indigo_device.name} ({indigo_device.address})")
+            self.logger.debug(f"🔌 Starting communication with Indigo device {indigo_device.name} ({indigo_device.address})")
             self.devices[indigo_device.id] = indigo_device
 
             # Ensure lookup maps exist
@@ -7521,7 +7910,7 @@ class SonosPlugin(object):
                         try:
                             self.propagate_artwork_to_slaves(indigo_device)
                         except Exception as _e:
-                            self.logger.warning(f"⚠️ early propagate_artwork_to_slaves failed for {indigo_device.name}: {_e}")
+                            self.logger.debug(f"⚠️ early propagate_artwork_to_slaves failed for {indigo_device.name}: {_e}")
             except Exception as e:
                 self.logger.warning(f"⚠️ coord-seed failed for {indigo_device.name}: {e}")
 
@@ -7987,7 +8376,7 @@ class SonosPlugin(object):
 #                                            f"coord_ip={coord_ip}, all_members={all_member_ips}, bonded={bonded_member_ips}"
 #                                        )
                         except Exception as hook_err:
-                            self.logger.warning(f"⚠️ Failed to invoke artwork propagation after ZGT: {hook_err}")
+                            self.logger.debug(f"⚠️ Failed to invoke artwork propagation after ZGT: {hook_err}")
 
                         self.logger.debug("📣 DT added for testing - Propagating updated Grouped states to all devices...")
                         #self._bootstrap_now_from_zgt()
@@ -8310,7 +8699,7 @@ class SonosPlugin(object):
                 else:
                     self.logger.debug("⚠️ Skipping artwork update — Indigo device could not be resolved from event")
             except Exception as e:
-                self.logger.warning(f"⚠️ Failed to update album artwork: {e}")
+                self.logger.debug(f"⚠️ Failed to update album artwork: {e}")
 
 
             # === Coordinator logic ===
@@ -9004,7 +9393,7 @@ class SonosPlugin(object):
                             f"coord_ip={coord_ip}, all_members={all_member_ips}, bonded={bonded_member_ips}"
                         )
         except Exception as e:
-            self.logger.warning(f"⚠️ Post-ZGT grouped/artwork check failed: {e}")
+            self.logger.debug(f"⚠️ Post-ZGT grouped/artwork check failed: {e}")
 
 
 
@@ -9995,7 +10384,7 @@ class SonosPlugin(object):
             sub_grouped = dev.states.get("Grouped", "false")
 
             if sub_grouped != coord_grouped:
-                self.logger.info(f"🔁 Syncing Sub '{dev.name}' Grouped flag → {coord_grouped} (match coordinator '{coordinator.name}')")
+                self.logger.debug(f"🔁 Syncing Sub '{dev.name}' Grouped flag → {coord_grouped} (match coordinator '{coordinator.name}')")
                 self.updateStateOnServer(dev, "Grouped", coord_grouped)
 
         # ✅ 🔄 Final fix: post-pass to reassign group names and flags for bonded devices missing or showing raw RINCON names
@@ -10241,10 +10630,28 @@ class SonosPlugin(object):
             except Exception as e:
                 self.logger.debug(f"poller cleanup failed for {dev.name}: {e}")
 
-            # 3) Clean local maps
+            # 3) Clean local maps — match IP-keyed entries by device id where possible
+            # so entries made under an old address (IP just changed in the config
+            # dialog) are purged too, not only the current one.
             try:
-                if hasattr(self, "ip_to_indigo_dev"):
-                    self.ip_to_indigo_dev = {k: v for k, v in self.ip_to_indigo_dev.items() if v.id != dev.id}
+                dev_ip = (dev.pluginProps.get("address") or dev.address or "").strip()
+                if hasattr(self, "devices") and isinstance(self.devices, dict):
+                    self.devices.pop(dev.id, None)
+                if hasattr(self, "deferred_start_devices"):
+                    self.deferred_start_devices.discard(dev.id)
+                if hasattr(self, "ip_to_indigo_device"):
+                    stale_ips = [k for k, v in self.ip_to_indigo_device.items()
+                                 if getattr(v, "id", None) == dev.id]
+                    for ip in stale_ips:
+                        self.ip_to_indigo_device.pop(ip, None)
+                        for map_name in ("soco_by_ip", "ip_to_soco_device", "uid_by_ip"):
+                            m = getattr(self, map_name, None)
+                            if isinstance(m, dict):
+                                m.pop(ip, None)
+                for map_name in ("soco_by_ip", "ip_to_soco_device", "uid_by_ip"):
+                    m = getattr(self, map_name, None)
+                    if isinstance(m, dict):
+                        m.pop(dev_ip, None)
             except Exception as e:
                 self.logger.debug(f"map cleanup failed for {dev.name}: {e}")
 
@@ -10283,7 +10690,7 @@ class SonosPlugin(object):
         same normalization/evaluation steps you run after a ZGT-driven change.
         """
         # Loud entry log so you can see it ran
-        self.logger.warning("🚀 BOOTSTRAP: starting post-startup normalization from live ZoneGroupTopology")
+        self.logger.debug("🚀 BOOTSTRAP: starting post-startup normalization from live ZoneGroupTopology")
 
         try:
             # Pick a reference IP: prefer your configured/root, else any discovered
@@ -10305,7 +10712,7 @@ class SonosPlugin(object):
             zone_state_xml = self.parseDirty(resp, "<ZoneGroupState>", "</ZoneGroupState>") or ""
 
             if not zone_state_xml:
-                self.logger.warning("⚠️ BOOTSTRAP: GetZoneGroupState returned no ZoneGroupState XML")
+                self.logger.debug("⚠️ BOOTSTRAP: GetZoneGroupState returned no ZoneGroupState XML")
                 # even if empty, still run your existing steps below so nothing is skipped
             else:
                 # Parse into the same structure your event path uses
@@ -10318,7 +10725,7 @@ class SonosPlugin(object):
                             self.zone_group_state_cache = copy.deepcopy(parsed_groups)
                         self.logger.info(f"💾 BOOTSTRAP: zone_group_state_cache seeded with {len(parsed_groups)} group(s)")
                     else:
-                        self.logger.warning("⚠️ BOOTSTRAP: parsed_groups is empty")
+                        self.logger.debug("⚠️ BOOTSTRAP: parsed_groups is empty")
                 except Exception as e:
                     self.logger.error(f"❌ BOOTSTRAP: parse_zone_group_state failed: {e}")
 
@@ -10360,7 +10767,7 @@ class SonosPlugin(object):
                 self.logger.error(f"❌ BOOTSTRAP: getSoundFiles failed (continuing): {e}")
 
         finally:
-            self.logger.warning("✅ BOOTSTRAP: finished post-startup normalization")
+            self.logger.debug("✅ BOOTSTRAP: finished post-startup normalization")
 
 
     def refresh_group_topology_after_plugin_zone_change(self):
@@ -10472,7 +10879,7 @@ class SonosPlugin(object):
                 self.rebuild_ip_to_device_map()
             if hasattr(self, "rebuild_uuid_maps_from_soco"):
                 self.rebuild_uuid_maps_from_soco()
-                self.logger.warning(f"📌 DEBUG: uuid_to_indigo_device now contains {len(self.uuid_to_indigo_device)} entries")
+                self.logger.debug(f"📌 DEBUG: uuid_to_indigo_device now contains {len(self.uuid_to_indigo_device)} entries")
 
             # NEW: ensure IP→coordinator device cache always exists (avoids NameError downstream)
             try:
@@ -10519,9 +10926,9 @@ class SonosPlugin(object):
                 if indigo_device:
                     self.update_album_artwork(dev=indigo_device, zone_ip=indigo_device.address.strip())
                 else:
-                    self.logger.warning("⚠️ Skipping artwork update — Indigo device is undefined")
+                    self.logger.debug("⚠️ Skipping artwork update — Indigo device is undefined")
             except Exception as e:
-                self.logger.warning(f"⚠️ Failed to update album artwork for {indigo_device.name if indigo_device else 'Unknown'}: {e}")
+                self.logger.debug(f"⚠️ Failed to update album artwork for {indigo_device.name if indigo_device else 'Unknown'}: {e}")
 
             # === Playback state refresh for coordinator ===
             if is_coordinator:
@@ -10636,10 +11043,10 @@ class SonosPlugin(object):
             try:
                 zone_ip = dev.address.strip()
                 if not zone_ip:
-                    self.logger.warning(f"⚠️ dev.address is empty for {dev.name}")
+                    self.logger.debug(f"⚠️ dev.address is empty for {dev.name}")
                     zone_ip = None
             except Exception as e:
-                self.logger.warning(f"⚠️ Failed to extract IP from dev: {e}")
+                self.logger.debug(f"⚠️ Failed to extract IP from dev: {e}")
                 zone_ip = None
 
         # ✅ Step 2: Try resolving zone_ip from event if not yet available
@@ -10660,14 +11067,14 @@ class SonosPlugin(object):
         # ✅ Step 4: Locate SoCo device and group info
         soco_device = self.getSoCoDeviceByIP(zone_ip)
         if not soco_device:
-            self.logger.warning(f"⚠️ No SoCo device found for IP {zone_ip}")
+            self.logger.debug(f"⚠️ No SoCo device found for IP {zone_ip}")
             return
 
         try:
             group = soco_device.group
             coordinator = group.coordinator
         except Exception as e:
-            self.logger.warning(f"⚠️ Failed to access group or coordinator for {zone_ip}: {e}")
+            self.logger.debug(f"⚠️ Failed to access group or coordinator for {zone_ip}: {e}")
             return
 
         is_master = ((coordinator.ip_address or "").strip() == zone_ip)
@@ -10691,7 +11098,7 @@ class SonosPlugin(object):
                     for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
                         try:
                             self.logger.debug(f"🎨 Attempting album art fetch from {album_art_uri} (attempt {attempt})")
-                            response = requests.get(album_art_uri, timeout=5)
+                            response = requests.get(album_art_uri, timeout=(3, 15))
                             if response.status_code == 200:
                                 image = Image.open(io.BytesIO(response.content))
                                 image.thumbnail((500, 500))
@@ -10699,7 +11106,7 @@ class SonosPlugin(object):
                                 image.save(master_artwork_path, format="JPEG", quality=75)
                                 break
                         except Exception as e:
-                            self.logger.warning(f"⚠️ Failed to fetch album art: {e}")
+                            self.logger.debug(f"⚠️ Failed to fetch album art: {e}")
                             time.sleep(0.5)
 
             # Ensure we can publish a URL for the coordinator even without a fresh event
@@ -10709,7 +11116,7 @@ class SonosPlugin(object):
                 try:
                     shutil.copyfile(DEFAULT_ART_PATH, master_artwork_path)
                 except Exception as e:
-                    self.logger.warning(f"⚠️ Failed to stage default artwork for coordinator {coordinator_ip}: {e}")
+                    self.logger.debug(f"⚠️ Failed to stage default artwork for coordinator {coordinator_ip}: {e}")
                 art_url = "http://localhost:8888/default_artwork.jpg"
 
             if coordinator_dev:
@@ -10761,7 +11168,7 @@ class SonosPlugin(object):
         # === Slave devices: copy master art ===
         # Make sure the master image exists (fallback to default so we never block propagation)
         if not os.path.exists(master_artwork_path):
-            self.logger.warning(f"⚠️ Master art missing for coord {coordinator_ip}; using default for propagation")
+            self.logger.debug(f"⚠️ Master art missing for coord {coordinator_ip}; using default for propagation")
             master_artwork_path = DEFAULT_ART_PATH
 
         for member in (getattr(group, "members", []) or []):
@@ -10771,14 +11178,14 @@ class SonosPlugin(object):
 
             slave_dev = self.ip_to_indigo_device.get(member_ip)
             if not slave_dev:
-                self.logger.warning(f"⚠️ No Indigo device for slave {getattr(member, 'player_name', member_ip)} ({member_ip})")
+                self.logger.debug(f"⚠️ No Indigo device for slave {getattr(member, 'player_name', member_ip)} ({member_ip})")
                 continue
 
             slave_art_path = f"{ARTWORK_FOLDER}sonos_art_{member_ip}.jpg"
             try:
                 if (not os.path.exists(slave_art_path)) or (not filecmp.cmp(master_artwork_path, slave_art_path, shallow=False)):
                     shutil.copyfile(master_artwork_path, slave_art_path)
-                    self.logger.info(f"🖼️ Copied artwork to slave {slave_dev.name}")
+                    self.logger.debug(f"🖼️ Copied artwork to slave {slave_dev.name}")
                 slave_dev.updateStateOnServer("ZP_ART", f"http://localhost:8888/sonos_art_{member_ip}.jpg")
             except Exception as e:
                 self.logger.error(f"❌ Failed copying art to {slave_dev.name}: {e}")
@@ -10843,14 +11250,14 @@ class SonosPlugin(object):
         # --- Find SoCo, group, coordinator ---
         soco_device = self.getSoCoDeviceByIP(zone_ip)
         if not soco_device:
-            self.logger.warning(f"⚠️ update_album_artwork: no SoCo for {zone_ip}")
+            self.logger.debug(f"⚠️ update_album_artwork: no SoCo for {zone_ip}")
             return
 
         try:
             group       = soco_device.group
             coordinator = group.coordinator
         except Exception as e:
-            self.logger.warning(f"⚠️ update_album_artwork: group/coordinator access failed for {zone_ip}: {e}")
+            self.logger.debug(f"⚠️ update_album_artwork: group/coordinator access failed for {zone_ip}: {e}")
             return
 
         coord_ip  = (getattr(coordinator, "ip_address", "") or "").strip()
@@ -10892,7 +11299,7 @@ class SonosPlugin(object):
             for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
                 try:
                     self.logger.debug(f"🎨 Fetching album art {album_art_uri} (attempt {attempt})")
-                    r = requests.get(album_art_uri, timeout=5)
+                    r = requests.get(album_art_uri, timeout=(3, 15))
                     if r.status_code == 200:
                         img = Image.open(io.BytesIO(r.content))
                         img.thumbnail((500, 500))
@@ -10900,7 +11307,7 @@ class SonosPlugin(object):
                         img.save(master_art_path, format="JPEG", quality=75)
                         break
                 except Exception as e:
-                    self.logger.warning(f"⚠️ Album art fetch failed: {e}")
+                    self.logger.debug(f"⚠️ Album art fetch failed: {e}")
                     time.sleep(0.4)
 
         # Ensure master file exists
@@ -10908,7 +11315,7 @@ class SonosPlugin(object):
             try:
                 shutil.copyfile(DEFAULT_ART_PATH, master_art_path)
             except Exception as e:
-                self.logger.warning(f"⚠️ Could not stage default master art for {coord_ip}: {e}")
+                self.logger.debug(f"⚠️ Could not stage default master art for {coord_ip}: {e}")
 
         # Update the coordinator’s ZP_ART
         coordinator_dev.updateStateOnServer("ZP_ART", f"http://localhost:8888/sonos_art_{coord_ip}.jpg")
@@ -10991,7 +11398,7 @@ class SonosPlugin(object):
             try:
                 if (not os.path.exists(slave_art_path)) or (not filecmp.cmp(master_art_path, slave_art_path, shallow=False)):
                     shutil.copyfile(master_art_path, slave_art_path)
-                    self.logger.info(f"🖼️ Copied artwork to slave {dev.name}")
+                    self.logger.debug(f"🖼️ Copied artwork to slave {dev.name}")
 
                 dev.updateStateOnServer("ZP_ART", f"http://localhost:8888/sonos_art_{slave_ip}.jpg")
             except Exception as e:
@@ -11061,7 +11468,7 @@ class SonosPlugin(object):
             try:
                 if (not os.path.exists(slave_art_path)) or (not filecmp.cmp(master_art_path, slave_art_path, shallow=False)):
                     shutil.copyfile(master_art_path, slave_art_path)
-                    self.logger.info(f"🖼️ Copied artwork to slave {dev.name}")
+                    self.logger.debug(f"🖼️ Copied artwork to slave {dev.name}")
 
                 dev.updateStateOnServer("ZP_ART", f"http://localhost:8888/sonos_art_{slave_ip}.jpg")
             except Exception as e:
@@ -11821,9 +12228,9 @@ class SonosPlugin(object):
             self.Sound_Files = []  # << correct instance var
             list_count = 0
 
-            self.logger.info(f"🔍 Scanning for MP3s in: {self.SoundFilePath}")
+            self.logger.debug(f"🔍 Scanning for MP3s in: {self.SoundFilePath}")
             for f in listdir(self.SoundFilePath):
-                self.logger.warning(f"🧪 Found file in folder: {f}")
+                self.logger.debug(f"🧪 Found file in folder: {f}")
                 if f.lower().endswith(".mp3"):
                     self.Sound_Files.append(f)
                     self.logger.info(f"🎵 Added sound file: {f}")
@@ -12084,35 +12491,50 @@ class SonosPlugin(object):
 
     def getAppleVoices(self, filter=""):
         try:
+            # Preferred source: `say -v '?'` — lists only voices that actually
+            # render (NSSpeechSynthesizer's availableVoices() includes modern ids
+            # that produce silence through the deprecated API). Values are plain
+            # voice names, which is what the `say`-based synthesis expects.
+            try:
+                import subprocess
+                out = subprocess.run(["/usr/bin/say", "-v", "?"],
+                                     capture_output=True, text=True, timeout=10)
+                say_voices = []
+                for line in (out.stdout or "").splitlines():
+                    # e.g. "Samantha            en_US    # Hello..." and
+                    #      "Eddy (English (UK)) en_GB    # Hello..." (single space)
+                    m = re.match(r"^(.+?)\s+([A-Za-z]{2,3}[_-][A-Za-z0-9-]+)\s*#", line)
+                    if m and m.group(1).strip():
+                        say_voices.append((m.group(1).strip(), f"{m.group(1).strip()} ({m.group(2).strip()})"))
+                if say_voices:
+                    say_voices.sort(key=lambda x: x[1].lower())
+                    return say_voices
+            except Exception as say_error:
+                self.logger.debug(f"getAppleVoices via 'say' failed ({say_error}); falling back to NSSpeechSynthesizer list")
+
             array = []
+            # Per-voice guard: one voice id with missing attributes (common with
+            # the modern com.apple.voice.* ids) must not empty the whole menu.
             for voice in NSVoices:
-                name = NSSpeechSynthesizer.attributesForVoice_(voice)['VoiceName']
-                locale = re.split('-|_', NSSpeechSynthesizer.attributesForVoice_(voice)['VoiceLocaleIdentifier'])
                 try:
-                    vl = language_codes.languages[locale[0]].encode('utf-8')
-                except Exception as exception_error:
-                    vl = locale[0]
-                try:
-                    vc = language_codes.countries[locale[1]].encode('utf-8')
-                except Exception as exception_error:
-                    vc = locale[1]
-                # array.append((voice,  vc + ', ' +  vl + ' | ' + name))
-
-                print(f"Voice: {type(voice)}")
-                print(f"vc: {type(voice)}")
-                print(f"vl: {type(voice)}")
-                print(f"name: {type(voice)}")
-
-                try:
-                    vc = vc.decode("utf-8")
-                except Exception as exception_error:
-                    pass
-                try:
-                    vl = vl.decode("utf-8")
-                except Exception as exception_error:
-                    pass
-
-                array.append((voice, f"{vc}, {vl} | {name}"))
+                    attrs = NSSpeechSynthesizer.attributesForVoice_(voice) or {}
+                    name = attrs.get('VoiceName') or str(voice).rsplit(".", 1)[-1]
+                    locale = re.split('-|_', attrs.get('VoiceLocaleIdentifier') or "")
+                    try:
+                        vl = language_codes.languages[locale[0]]
+                    except Exception:
+                        vl = locale[0] if locale and locale[0] else "?"
+                    try:
+                        vc = language_codes.countries[locale[1]]
+                    except Exception:
+                        vc = locale[1] if len(locale) > 1 else "?"
+                    if isinstance(vl, bytes):
+                        vl = vl.decode("utf-8", errors="ignore")
+                    if isinstance(vc, bytes):
+                        vc = vc.decode("utf-8", errors="ignore")
+                    array.append((voice, f"{vc}, {vl} | {name}"))
+                except Exception as voice_error:
+                    self.logger.debug(f"getAppleVoices: skipping voice {voice!r}: {voice_error}")
 
             array.sort(key=lambda x: x[1])
             return array

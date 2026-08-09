@@ -2,7 +2,34 @@
 
 Control your entire Sonos system from [Indigo](https://www.indigodomo.com) — playback, volume, grouping, favourites, streaming services, announcements, soundbar tuning, and native Sonos alarms — as first-class Indigo devices, actions, and triggers.
 
-**Current version: 2025.2.3** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
+**Current version: 2025.2.4** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
+
+---
+
+## Highlights of 2025.2.4
+
+This release overhauls the announcement system end-to-end and fixes several bugs reported against 2025.2.3.
+
+### Bug fixes
+
+- **Multi-zone announcements fixed** — a grouping-semantics regression made the coordinator sequentially join every other zone's group instead of the zones joining the coordinator; announcements only played on one speaker. All selected zones now group correctly and play together.
+- **Polly TTS "Unable to locate credentials" fixed** — Polly/IVONA/Pandora/SiriusXM/Microsoft credentials (and Apple voices) are loaded at plugin startup again, not only after re-saving the config dialog.
+- **TTS announcements fixed** — all TTS engines wrote their audio where the announcement HTTP server never looked (silent 404s), and File announcements could measure a stale file's duration and cut off mid-play. All announcement audio now lives in one served location.
+- **Apple text-to-speech reworked** — synthesis now uses macOS `say` (the previous `NSSpeechSynthesizer` API is deprecated and renders silence for modern voices), the voice menu lists only voices that actually work, and output is Sonos-compatible 44.1 kHz WAV (the old AIFF output was an AIFF-C container Sonos rejects).
+- **Device IP changes self-heal** — a player that moves to a new DHCP address is found again by its Sonos id during background retry and its Indigo device address is updated automatically; no more delete-and-recreate or control-page edits (forum-requested).
+- **Stale group-state ghosts fixed** — plugin caches are resynced from live topology after announcements, so Indigo device states track what the players are actually doing.
+
+### New: full group & playback restore around announcements
+
+Announcements now snapshot every target zone (SoCo Snapshot/Restore — the same mechanism Home Assistant uses; selectable in Plugin Config, on by default) and afterwards rebuild the **exact pre-announcement state**: original groups re-form (including group members that weren't part of the announcement), standalone zones return to standalone, volumes/mutes restore, and interrupted music resumes at the same track and position. See the Known Limitation in the version history: cloud-queue sources (Alexa-initiated, Spotify Connect, AirPlay) cannot be programmatically resumed.
+
+### Cross-VLAN diagnostics
+
+Players on a separate VLAN must be able to reach the Indigo Mac on tcp/8889 (announcements), tcp/8888 (album art), and tcp/1400 (event notifications) — a one-way firewall breaks all three silently while normal control keeps working. The plugin now detects players on a different subnet at startup and logs the exact rules needed, and a fetch watchdog reports when a player never pulled the announcement file.
+
+### Quieter, more useful logging
+
+The plugin log file always captures full debug detail (nothing is lost when the Event Log is set to normal), while Event Log noise — album-art fetch retries, per-event state chatter, startup floods — has been sharply reduced. Album-art fetches use longer timeouts, and the last unbounded HTTP calls got timeouts.
 
 ---
 
@@ -102,12 +129,17 @@ Grouped players mirror the coordinator's enriched metadata states, so a control 
 
 ## Troubleshooting
 
+- **Announcements play no audio / artwork blank / states go stale, but control works (players on a separate VLAN)** — the players *pull* announcements, album art, and push event notifications *to* the Indigo Mac. A one-way LAN→VLAN firewall breaks all three silently. Allow the Sonos VLAN → Indigo Mac on **tcp/8889** (announcements), **tcp/8888** (album art), and **tcp/1400** (event notifications). The plugin logs a startup warning naming the exact rules when it detects players on another subnet.
 - **A player shows `offline`** — the plugin probes it every 60 s and will restore it automatically once reachable. Nothing to do.
 - **Config dialog, favourites lists, or actions feel slow** — check the log for a player timing out; one unreachable IP no longer blocks the plugin, but fixing the network (or deleting a decommissioned player's device) keeps logs clean.
 - **Favourite won't play** — check the log: unknown favourite types are logged with their URI. Open an issue including that line.
 - **Menu → dump options** — group topology, subscribed devices, and SiriusXM channel dumps are available as diagnostic aids under the plugin menu.
 
 ## Version history
+
+**2025.2.4** — Announcement system overhaul: multi-zone announcements fixed (grouping semantics regression), full **group & playback restore** after announcements — zones return to their exact pre-announcement groups (including group members that weren't part of the announcement) and music resumes at the same track/position via SoCo Snapshot/Restore (selectable in Plugin Config, on by default, with the legacy flow as fallback). Apple text-to-speech reworked onto macOS `say` (voice menu now lists only voices that actually render; output is Sonos-compatible 44.1 kHz WAV). Polly/IVONA/Pandora/SiriusXM credentials and Apple voices load at startup again. TTS audio unified onto the announcement HTTP server's folder (TTS previously 404'd; File announcements could probe a stale file's duration). Cross-VLAN diagnostics: startup warning + a fetch watchdog name the exact firewall rules needed (players must reach the Mac on tcp/8889 announcements, tcp/8888 album art, tcp/1400 event notifications). DHCP-moved players self-heal by matching their RINCON id in discovery and updating the device address automatically. Plugin log file now always captures full debug detail; Event Log noise sharply reduced. Album-art fetches use longer timeouts and no longer warn.
+
+> **Known limitation — announcement playback resume:** sources Sonos exposes as *cloud queues* — Alexa-initiated music, Spotify Connect, and AirPlay streams — cannot be restarted programmatically (Sonos provides no API to resume them; Home Assistant has the same limitation). After an announcement, grouping and volume are still restored for those zones, but that music will not auto-resume. Local queue playback, Sonos favourites, and radio streams all resume normally, at the same track and position.
 
 **2025.2.3** — Offline-player resilience (probe gating, UID caching, bounded timeouts, clean shutdown), routed-VLAN support, announcement topology-storm fix, state-list resync, 10 restored actions, favourites routing fixes, new Equalizer/soundbar actions, native Sonos alarm management. See [PR #17](https://github.com/IndigoDomotics/Sonos/pull/17).
 

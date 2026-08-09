@@ -103,7 +103,7 @@ class Plugin(indigo.PluginBase):
         # Setup logging
         log_format = logging.Formatter("%(asctime)s.%(msecs)03d\t%(levelname)-12s\t%(name)s.%(funcName)-25s %(msg)s", datefmt="%Y-%m-%d %H:%M:%S")
         self.plugin_file_handler.setFormatter(log_format)
-        self.plugin_file_handler.setLevel(LOG_LEVEL_INFO)  # Logging Level for plugin log file
+        self.plugin_file_handler.setLevel(LOG_LEVEL_DEBUGGING)  # Plugin log file always captures debug detail
         self.indigo_log_handler.setLevel(LOG_LEVEL_INFO)   # Logging level for Indigo Event Log
 
         self.logger = logging.getLogger("Plugin.Sonos")

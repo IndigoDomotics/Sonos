@@ -65,6 +65,12 @@
 	<Field id="SoundFilePath" type="textfield">
 		<Label>Sound File Path:</Label>
 	</Field>
+	<Field id="useSocoSnapshotNote" type="label" fontColor="darkgray" fontSize="small" alignWithControl="false">
+		<Label>Save and restore player state around announcements using SoCo Snapshot/Restore (recommended, same mechanism Home Assistant uses). Untick to fall back to the legacy save/restore flow.</Label>
+	</Field>
+	<Field type="checkbox" id="useSocoSnapshot" defaultValue="true" tooltip="Snapshot and restore player state with SoCo around announcements">
+		<Label>Use SoCo Snapshot/Restore for announcements:</Label>
+	</Field>
 	<Field id="simpleSeparator3" type="separator"/>
 	<Field id="PandoraNote" type="label" fontColor="darkgray" fontSize="small" alignWithControl="false">
 		<Label>Check this box if you have an active Pandora account configured on the Sonos system.</Label>
