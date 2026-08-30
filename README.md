@@ -2,7 +2,16 @@
 
 Control your entire Sonos system from [Indigo](https://www.indigodomo.com) — playback, volume, grouping, favourites, streaming services, announcements, soundbar tuning, and native Sonos alarms — as first-class Indigo devices, actions, and triggers.
 
-**Current version: 2025.2.4** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
+**Current version: 2025.2.5** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
+
+---
+
+## What's new in 2025.2.5
+
+Two field-reported fixes on top of the 2025.2.4 announcement overhaul:
+
+- **Volume/mute/EQ actions on a grouped player now adjust that player, not the group master.** Triggering Volume Up/Down (or Mute, Bass, Treble, or any soundbar EQ action) against a zone that was grouped as a slave used to be redirected to the group coordinator. These are per-player settings — each Sonos keeps its own volume while grouped — so they now always target the device the action names. To change a whole group's volume, use the Group Volume / Group Mute actions as before.
+- **No more warnings for bonded speakers after announcements.** Zones with bonded satellites (e.g. a Beam with surround speakers and a Sub) logged harmless "could not re-join" warnings when the announcement restore tried to re-group the satellites — they never leave their bond and don't accept grouping commands. They're now excluded from the restore step.
 
 ---
 
@@ -136,6 +145,8 @@ Grouped players mirror the coordinator's enriched metadata states, so a control 
 - **Menu → dump options** — group topology, subscribed devices, and SiriusXM channel dumps are available as diagnostic aids under the plugin menu.
 
 ## Version history
+
+**2025.2.5** — Per-player controls fixed for grouped zones: Volume Up/Down, Volume, Mute, Bass, Treble, and all soundbar EQ actions now target the specific ZonePlayer named in the action instead of being redirected to the group coordinator (Group Volume/Group Mute remain the group-wide controls). Announcement group-restore now skips bonded satellites (surrounds/Sub bonded to a soundbar), eliminating harmless "could not re-join" warnings on home-theater setups.
 
 **2025.2.4** — Announcement system overhaul: multi-zone announcements fixed (grouping semantics regression), full **group & playback restore** after announcements — zones return to their exact pre-announcement groups (including group members that weren't part of the announcement) and music resumes at the same track/position via SoCo Snapshot/Restore (selectable in Plugin Config, on by default, with the legacy flow as fallback). Apple text-to-speech reworked onto macOS `say` (voice menu now lists only voices that actually render; output is Sonos-compatible 44.1 kHz WAV). Polly/IVONA/Pandora/SiriusXM credentials and Apple voices load at startup again. TTS audio unified onto the announcement HTTP server's folder (TTS previously 404'd; File announcements could probe a stale file's duration). Cross-VLAN diagnostics: startup warning + a fetch watchdog name the exact firewall rules needed (players must reach the Mac on tcp/8889 announcements, tcp/8888 album art, tcp/1400 event notifications). DHCP-moved players self-heal by matching their RINCON id in discovery and updating the device address automatically. Plugin log file now always captures full debug detail; Event Log noise sharply reduced. Album-art fetches use longer timeouts and no longer warn.
 

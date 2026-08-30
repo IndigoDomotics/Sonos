@@ -647,6 +647,12 @@ class SonosPlugin(object):
             CoordinatorIP = coordinator_ip
             CoordinatorDev = coordinator_dev
 
+            # Per-player controls (RenderingControl: volume/mute/bass/treble)
+            # must target the device itself — every player keeps its own volume
+            # even while grouped as a slave. The coordinator redirect (zoneIP)
+            # is only correct for transport and Group* commands.
+            dev_ip = (dev.pluginProps.get("address") or dev.address or "").strip() or zoneIP
+
             # Fast-path: dedicated handlers
             if action_id in dispatch_table:
                 dispatch_table[action_id](pluginAction, dev, zoneIP)
@@ -774,13 +780,13 @@ class SonosPlugin(object):
 
             elif action_id in ("actionMuteOn", "MuteOn"):
                 self.plugin.debugLog("Sonos Action: Mute On")
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetMute", "<Channel>Master</Channel><DesiredMute>1</DesiredMute>")
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetMute", "<Channel>Master</Channel><DesiredMute>1</DesiredMute>")
                 indigo.server.log("ZonePlayer: %s, Mute On" % dev.name)
                 return
 
             elif action_id in ("actionMuteOff", "MuteOff"):
                 self.plugin.debugLog("Sonos Action: Mute Off")
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetMute", "<Channel>Master</Channel><DesiredMute>0</DesiredMute>")
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetMute", "<Channel>Master</Channel><DesiredMute>0</DesiredMute>")
                 indigo.server.log("ZonePlayer: %s, Mute Off" % dev.name)
                 return
 
@@ -989,7 +995,7 @@ class SonosPlugin(object):
             elif action_id == "actionBassUp":
                 current = int(dev.states.get("ZP_BASS", 0))
                 newVal = max(min(current + 1, 10), -10)
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetBass",
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetBass",
                               f"<DesiredBass>{newVal}</DesiredBass>")
                 self.logger.info(f"🔊 Bass increased on {dev.name}: {current} → {newVal}")
                 self.refresh_transport_state(zoneIP)
@@ -998,7 +1004,7 @@ class SonosPlugin(object):
             elif action_id == "actionBassDown":
                 current = int(dev.states.get("ZP_BASS", 0))
                 newVal = max(min(current - 1, 10), -10)
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetBass",
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetBass",
                               f"<DesiredBass>{newVal}</DesiredBass>")
                 self.logger.info(f"🔉 Bass decreased on {dev.name}: {current} → {newVal}")
                 self.refresh_transport_state(zoneIP)
@@ -1007,7 +1013,7 @@ class SonosPlugin(object):
             elif action_id == "actionTrebleUp":
                 current = int(dev.states.get("ZP_TREBLE", 0))
                 newVal = max(min(current + 1, 10), -10)
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetTreble",
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetTreble",
                               f"<DesiredTreble>{newVal}</DesiredTreble>")
                 self.logger.info(f"🎶 Treble increased on {dev.name}: {current} → {newVal}")
                 self.refresh_transport_state(zoneIP)
@@ -1016,7 +1022,7 @@ class SonosPlugin(object):
             elif action_id == "actionTrebleDown":
                 current = int(dev.states.get("ZP_TREBLE", 0))
                 newVal = max(min(current - 1, 10), -10)
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetTreble",
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetTreble",
                               f"<DesiredTreble>{newVal}</DesiredTreble>")
                 self.logger.info(f"🎵 Treble decreased on {dev.name}: {current} → {newVal}")
                 self.refresh_transport_state(zoneIP)
@@ -1029,73 +1035,61 @@ class SonosPlugin(object):
                 new_volume = int(eval(self.plugin.substitute(pluginAction.props.get("setting"))))
                 if new_volume < 0 or new_volume > 100:
                     new_volume = current_volume
-                self.SOAPSend (zoneIP, "/MediaRenderer", "/RenderingControl", "SetVolume", "<Channel>Master</Channel><DesiredVolume>"+str(new_volume)+"</DesiredVolume>")
+                self.SOAPSend (dev_ip, "/MediaRenderer", "/RenderingControl", "SetVolume", "<Channel>Master</Channel><DesiredVolume>"+str(new_volume)+"</DesiredVolume>")
                 indigo.server.log(u"ZonePlayer: %s, Current Volume: %s, New Volume: %s" % (dev.name, current_volume, new_volume))
                 return
 
             elif action_id == "actionVolumeUp":
                 self.safe_debug("🧪 Matched action_id == actionVolumeUp")
 
-                # Pull volume from coordinator (not the slave!)
-                current = int(coordinator_dev.states.get("ZP_VOLUME_MASTER", 0))
+                # Volume is per-player even when grouped — read and adjust the
+                # targeted device's own volume, never the coordinator's.
+                current = int(dev.states.get("ZP_VOLUME_MASTER", 0))
                 new_volume = min(100, current + 5)
 
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetVolume",
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetVolume",
                               f"<Channel>Master</Channel><DesiredVolume>{new_volume}</DesiredVolume>")
 
-                self.logger.info(f"🔊 Volume UP sent to {coordinator_dev.name}: {current} → {new_volume}")
-
-                # If this was initiated from a slave, update its visible state to match
-                if dev.id != coordinator_dev.id:
-                    dev.updateStateOnServer("ZP_VOLUME_MASTER", new_volume)
-                    self.safe_debug(f"🔁 Synced ZP_VOLUME_MASTER from {coordinator_dev.name} → {dev.name}")
+                self.logger.info(f"🔊 Volume UP sent to {dev.name}: {current} → {new_volume}")
+                dev.updateStateOnServer("ZP_VOLUME_MASTER", new_volume)
                 return
 
             elif action_id == "actionVolumeDown":
                 self.safe_debug("🧪 Matched action_id == actionVolumeDown")
 
-                current = int(coordinator_dev.states.get("ZP_VOLUME_MASTER", 0))
+                current = int(dev.states.get("ZP_VOLUME_MASTER", 0))
                 new_volume = max(0, current - 5)
 
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetVolume",
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetVolume",
                               f"<Channel>Master</Channel><DesiredVolume>{new_volume}</DesiredVolume>")
 
-                self.logger.info(f"🔉 Volume DOWN sent to {coordinator_dev.name}: {current} → {new_volume}")
-
-                if dev.id != coordinator_dev.id:
-                    dev.updateStateOnServer("ZP_VOLUME_MASTER", new_volume)
-                    self.safe_debug(f"🔁 Synced ZP_VOLUME_MASTER from {coordinator_dev.name} → {dev.name}")
+                self.logger.info(f"🔉 Volume DOWN sent to {dev.name}: {current} → {new_volume}")
+                dev.updateStateOnServer("ZP_VOLUME_MASTER", new_volume)
                 return
 
             elif action_id == "actionMuteToggle":
                 self.safe_debug("🧪 Matched action_id == actionMuteToggle")
 
-                # Get mute state from coordinator, not slave
-                raw_state = coordinator_dev.states.get("ZP_MUTE", "unknown")
+                raw_state = dev.states.get("ZP_MUTE", "unknown")
                 mute_state = str(raw_state).lower() == "true"
 
                 mute_val = "0" if mute_state else "1"
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetMute",
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetMute",
                               f"<Channel>Master</Channel><DesiredMute>{mute_val}</DesiredMute>")
 
-                self.logger.info(f"🎚 Mute TOGGLE sent to {coordinator_dev.name}: {'Off' if mute_state else 'On'}")
-
-                # Optionally update the slave state immediately
-                if dev.id != coordinator_dev.id:
-                    new_state = "false" if mute_state else "true"
-                    dev.updateStateOnServer("ZP_MUTE", new_state)
-                    self.safe_debug(f"🔁 Synced ZP_MUTE from {coordinator_dev.name} → {dev.name}: {new_state}")
+                self.logger.info(f"🎚 Mute TOGGLE sent to {dev.name}: {'Off' if mute_state else 'On'}")
+                dev.updateStateOnServer("ZP_MUTE", "false" if mute_state else "true")
                 return
 
             elif action_id == "actionMuteOn":
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetMute",
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetMute",
                               "<Channel>Master</Channel><DesiredMute>1</DesiredMute>")
                 self.logger.info(f"🔇 Mute ON for {dev.name}")
                 self.refresh_transport_state(zoneIP)
                 return
 
             elif action_id == "actionMuteOff":
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetMute",
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetMute",
                               "<Channel>Master</Channel><DesiredMute>0</DesiredMute>")
                 self.logger.info(f"🔊 Mute OFF for {dev.name}")
                 self.refresh_transport_state(zoneIP)
@@ -1600,7 +1594,7 @@ class SonosPlugin(object):
                     self.logger.error(f"❌ Invalid bass value '{setting}' for {dev.name} (expected -10..10)")
                     return
                 current_bass = dev.states.get("ZP_BASS", "0")
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetBass", f"<DesiredBass>{new_bass}</DesiredBass>")
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetBass", f"<DesiredBass>{new_bass}</DesiredBass>")
                 self.logger.info(f"ZonePlayer: {dev.name}, Current Bass: {current_bass}, New Bass: {new_bass}")
                 return
 
@@ -1612,14 +1606,14 @@ class SonosPlugin(object):
                     self.logger.error(f"❌ Invalid treble value '{setting}' for {dev.name} (expected -10..10)")
                     return
                 current_treble = dev.states.get("ZP_TREBLE", "0")
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetTreble", f"<DesiredTreble>{new_treble}</DesiredTreble>")
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetTreble", f"<DesiredTreble>{new_treble}</DesiredTreble>")
                 self.logger.info(f"ZonePlayer: {dev.name}, Current Treble: {current_treble}, New Treble: {new_treble}")
                 return
 
             elif action_id in ("actionNightMode", "NightMode"):
                 setting = pluginAction.props.get("setting")
                 mode = 1 if setting in (True, "true", "True", 1, "1", "on") else 0
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>NightMode</EQType><DesiredValue>{mode}</DesiredValue>")
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>NightMode</EQType><DesiredValue>{mode}</DesiredValue>")
                 self.logger.info(f"ZonePlayer: {dev.name}, Night Mode: {bool(mode)}")
                 return
 
@@ -1628,7 +1622,7 @@ class SonosPlugin(object):
             elif action_id in ("actionSpeechEnhancement", "SpeechEnhancement"):
                 setting = pluginAction.props.get("setting")
                 mode = 1 if setting in (True, "true", "True", 1, "1", "on") else 0
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>DialogLevel</EQType><DesiredValue>{mode}</DesiredValue>")
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>DialogLevel</EQType><DesiredValue>{mode}</DesiredValue>")
                 self.logger.info(f"ZonePlayer: {dev.name}, Speech Enhancement: {bool(mode)}")
                 return
 
@@ -1639,14 +1633,14 @@ class SonosPlugin(object):
                 except (TypeError, ValueError):
                     self.logger.error(f"❌ Invalid audio delay '{setting}' for {dev.name} (expected 0..5)")
                     return
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>AudioDelay</EQType><DesiredValue>{delay}</DesiredValue>")
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>AudioDelay</EQType><DesiredValue>{delay}</DesiredValue>")
                 self.logger.info(f"ZonePlayer: {dev.name}, Audio Delay: {delay}")
                 return
 
             elif action_id in ("actionSurroundEnable", "SurroundEnable"):
                 setting = pluginAction.props.get("setting")
                 mode = 1 if setting in (True, "true", "True", 1, "1", "on") else 0
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>SurroundEnable</EQType><DesiredValue>{mode}</DesiredValue>")
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>SurroundEnable</EQType><DesiredValue>{mode}</DesiredValue>")
                 self.logger.info(f"ZonePlayer: {dev.name}, Surround Speakers: {'enabled' if mode else 'disabled'}")
                 return
 
@@ -1657,7 +1651,7 @@ class SonosPlugin(object):
                 except (TypeError, ValueError):
                     self.logger.error(f"❌ Invalid surround level '{setting}' for {dev.name} (expected -15..15)")
                     return
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>SurroundLevel</EQType><DesiredValue>{level}</DesiredValue>")
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>SurroundLevel</EQType><DesiredValue>{level}</DesiredValue>")
                 self.logger.info(f"ZonePlayer: {dev.name}, Surround Level (TV): {level}")
                 return
 
@@ -1668,14 +1662,14 @@ class SonosPlugin(object):
                 except (TypeError, ValueError):
                     self.logger.error(f"❌ Invalid music surround level '{setting}' for {dev.name} (expected -15..15)")
                     return
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>MusicSurroundLevel</EQType><DesiredValue>{level}</DesiredValue>")
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>MusicSurroundLevel</EQType><DesiredValue>{level}</DesiredValue>")
                 self.logger.info(f"ZonePlayer: {dev.name}, Surround Level (Music): {level}")
                 return
 
             elif action_id in ("actionMusicFullVolume", "MusicFullVolume"):
                 setting = pluginAction.props.get("setting")
                 mode = 1 if setting in (True, "true", "True", 1, "1", "on") else 0  # 1 = full volume, 0 = ambient
-                self.SOAPSend(zoneIP, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>SurroundMode</EQType><DesiredValue>{mode}</DesiredValue>")
+                self.SOAPSend(dev_ip, "/MediaRenderer", "/RenderingControl", "SetEQ", f"<EQType>SurroundMode</EQType><DesiredValue>{mode}</DesiredValue>")
                 self.logger.info(f"ZonePlayer: {dev.name}, Music on Surrounds: {'full volume' if mode else 'ambient'}")
                 return
 
@@ -5901,9 +5895,18 @@ class SonosPlugin(object):
                                 elif grp is not None:
                                     for m in list(getattr(grp, "members", []) or []):
                                         try:
-                                            if getattr(m, "uid", None) != getattr(_soco, "uid", None) \
-                                                    and (m.ip_address or "").strip() not in ann_ips:
-                                                orig_members.append(m)
+                                            if getattr(m, "uid", None) == getattr(_soco, "uid", None) \
+                                                    or (m.ip_address or "").strip() in ann_ips:
+                                                continue
+                                            # Bonded satellites (Sub, surrounds, the
+                                            # slave of a stereo pair) appear as group
+                                            # members but are invisible zones — they
+                                            # never leave their bond and REFUSE join()
+                                            # (connection reset), so don't try to
+                                            # merge them back.
+                                            if not m.is_visible:
+                                                continue
+                                            orig_members.append(m)
                                         except Exception:
                                             continue
                             except Exception as topo_error:
