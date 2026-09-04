@@ -41,6 +41,8 @@ try:
 except ImportError:
     pass
 
+from contextlib import closing
+
 import soco
 import soco.core
 import soco.events
@@ -5714,7 +5716,28 @@ class SonosPlugin(object):
                     announcement = self.plugin.substitute(props.get("POLLY_setting"), validateOnly=False)
                     client = boto3.client('polly', aws_access_key_id=self.PollyaccessKey,
                                           aws_secret_access_key=self.PollysecretKey, region_name='us-east-1')
-                    response = client.synthesize_speech(OutputFormat='mp3', Text=announcement, VoiceId=props.get("POLLY_voice"))
+                    polly_voice = (props.get("POLLY_voice") or "").strip()
+                    if not polly_voice:
+                        # Actions saved while the Voice menu was broken stored ''.
+                        polly_voice = PollyVoices[0][0] if PollyVoices else "Joanna"
+                        self.logger.warning(
+                            f"⚠️ No Polly voice set in this action (saved while the voice list was "
+                            f"unavailable) — using '{polly_voice}'. Re-open and re-save the action "
+                            f"to pick a voice.")
+                    # Voice values are "VoiceId|engine" (menu offers every tier a
+                    # voice supports). Plain "VoiceId" = old saved action → pick
+                    # the cheapest supported engine; AWS rejects a missing Engine
+                    # for the many post-2019 voices that aren't 'standard'.
+                    polly_engine = None
+                    if "|" in polly_voice:
+                        polly_voice, polly_engine = polly_voice.split("|", 1)
+                    engines = next((v[5] for v in PollyVoices
+                                    if v[0] == polly_voice and len(v) > 5 and v[5]), None)
+                    if not polly_engine or (engines and polly_engine not in engines):
+                        polly_engine = self._polly_engine_for(engines)
+                    self.logger.debug(f"[POLLY] voice={polly_voice} engines={engines} → using '{polly_engine}'")
+                    response = client.synthesize_speech(OutputFormat='mp3', Text=announcement,
+                                                        VoiceId=polly_voice, Engine=polly_engine)
                     if "AudioStream" in response:
                         with closing(response["AudioStream"]) as stream:
                             data = stream.read()
@@ -12481,11 +12504,54 @@ class SonosPlugin(object):
         except Exception as exception_error:
             self.exception_handler(exception_error, True)  # Log error and display failing statement
 
+    def PollyVoices(self):
+        """Populate the global PollyVoices list from AWS describe_voices.
+
+        Restored: this method was deleted in an earlier refactor while its
+        call site in processServicePrefs survived — the swallowed
+        AttributeError left the voice list empty, the action dialog's Voice
+        menu blank, and saved actions with POLLY_voice='' (ValidationException
+        at announcement time).
+        """
+        try:
+            global PollyVoices
+            client = boto3.client("polly", aws_access_key_id=self.PollyaccessKey,
+                                  aws_secret_access_key=self.PollysecretKey, region_name="us-east-1")
+            content = client.describe_voices()
+            if int(content.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)) == 200:
+                PollyVoices.clear()  # re-entrant on prefs re-save; avoid duplicates
+                for voice in content.get("Voices", []):
+                    PollyVoices.append([voice["Id"], voice["Name"], voice["Gender"],
+                                        voice["LanguageCode"], voice["LanguageName"],
+                                        list(voice.get("SupportedEngines") or [])])
+                self.logger.info(f"Loaded Polly Voices... [{len(PollyVoices)}]")
+        except Exception as exception_error:
+            self.logger.error(f"❌ Could not load Polly voices: {exception_error}")
+
+    @staticmethod
+    def _polly_engine_for(engines):
+        """Pick the engine synthesis will use for a voice: cheapest supported
+        first (standard ≈ $4/1M chars, neural ≈ $16, long-form/generative ≈ $30+)."""
+        if not engines:
+            return "standard"
+        return next((e for e in ("standard", "neural", "long-form", "generative")
+                     if e in engines), engines[0])
+
     def getPollyVoices(self, filter=""):
         try:
+            # One menu entry per voice+engine combination so every tier a voice
+            # supports (standard/neural/long-form/generative) is selectable.
+            # Value format "VoiceId|engine"; plain "VoiceId" (old saved actions)
+            # still works — synthesis auto-picks the cheapest engine for those.
             array = []
             for voice in PollyVoices:
-                array.append((voice[0], voice[4] + " | " + voice[1]))
+                engines = voice[5] if len(voice) > 5 else None
+                if engines:
+                    for engine in engines:
+                        array.append((f"{voice[0]}|{engine}",
+                                      f"{voice[4]} | {voice[1]}  ({engine})"))
+                else:
+                    array.append((voice[0], f"{voice[4]} | {voice[1]}"))
             array.sort(key=lambda x: x[1])
             return array
 

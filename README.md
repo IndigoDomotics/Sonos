@@ -2,7 +2,7 @@
 
 Control your entire Sonos system from [Indigo](https://www.indigodomo.com) — playback, volume, grouping, favourites, streaming services, announcements, soundbar tuning, and native Sonos alarms — as first-class Indigo devices, actions, and triggers.
 
-**Current version: 2025.2.5** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
+**Current version: 2025.2.6** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
 
 ---
 
@@ -145,6 +145,8 @@ Grouped players mirror the coordinator's enriched metadata states, so a control 
 - **Menu → dump options** — group topology, subscribed devices, and SiriusXM channel dumps are available as diagnostic aids under the plugin menu.
 
 ## Version history
+
+**2025.2.6** — Amazon Polly announcements fixed: the Polly voice-loading routine had been lost in a years-old refactor, leaving the action dialog's Voice menu empty and saved actions failing with `ValidationException ... voiceId ''`. Voices now load at startup (`Loaded Polly Voices... [N]` in the log); actions saved while the menu was broken fall back to a default voice with a log warning — re-open and re-save the action to pick your voice.
 
 **2025.2.5** — Per-player controls fixed for grouped zones: Volume Up/Down, Volume, Mute, Bass, Treble, and all soundbar EQ actions now target the specific ZonePlayer named in the action instead of being redirected to the group coordinator (Group Volume/Group Mute remain the group-wide controls). Announcement group-restore now skips bonded satellites (surrounds/Sub bonded to a soundbar), eliminating harmless "could not re-join" warnings on home-theater setups.
 
