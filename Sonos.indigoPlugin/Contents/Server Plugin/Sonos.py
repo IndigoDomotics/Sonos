@@ -1914,28 +1914,34 @@ class SonosPlugin(object):
                         if all(x.id != d.id for x in self.evaluated_group_members_by_coordinator[group_friendly]):
                             self.evaluated_group_members_by_coordinator[group_friendly].append(d)
 
-                    # 2) zone_group_state_cache: ensure coordinator+members are represented
+                    # 2) zone_group_state_cache: ensure coordinator+members are represented.
+                    # Only prime under a real RINCON group uid — a friendly-name
+                    # key with no coordinator lingers as a malformed entry that
+                    # pollutes every later evaluation pass.
                     self.zone_group_state_cache = getattr(self, "zone_group_state_cache", {}) or {}
                     grp_uid = None
                     if coord_soco and getattr(coord_soco, "group", None):
                         grp_uid = getattr(coord_soco.group, "uid", None)
-                    cache_key = grp_uid or group_friendly
-                    entry = self.zone_group_state_cache.setdefault(cache_key, {"coordinator": None, "members": []})
+                    if not grp_uid:
+                        # evaluate pass will pick topology up from the next ZGT
+                        self.logger.debug("addPlayer cache prime skipped: no group uid available yet")
+                    else:
+                        entry = self.zone_group_state_cache.setdefault(grp_uid, {"coordinator": None, "members": []})
 
-                    if coord_soco and getattr(coord_soco, "uid", None):
-                        entry["coordinator"] = coord_soco.uid
+                        if coord_soco and getattr(coord_soco, "uid", None):
+                            entry["coordinator"] = coord_soco.uid
 
-                    def _ensure_member(dev_obj):
-                        ip = (dev_obj.pluginProps.get("address", "") or "").strip()
-                        soco = self.soco_by_ip.get(ip)
-                        uuid = getattr(soco, "uid", None)
-                        name = dev_obj.states.get("GROUP_Name") or dev_obj.name
-                        # Store as dicts; evaluator handles dict members
-                        if uuid and not any((m.get("uuid") if isinstance(m, dict) else m) == uuid for m in entry["members"]):
-                            entry["members"].append({"uuid": uuid, "ip": ip, "name": name})
+                        def _ensure_member(dev_obj):
+                            ip = (dev_obj.pluginProps.get("address", "") or "").strip()
+                            soco = self.soco_by_ip.get(ip)
+                            uuid = getattr(soco, "uid", None)
+                            name = dev_obj.states.get("GROUP_Name") or dev_obj.name
+                            # Store as dicts; evaluator handles dict members
+                            if uuid and not any((m.get("uuid") if isinstance(m, dict) else m) == uuid for m in entry["members"]):
+                                entry["members"].append({"uuid": uuid, "ip": ip, "name": name})
 
-                    _ensure_member(dev_coord)
-                    _ensure_member(dev_join)
+                        _ensure_member(dev_coord)
+                        _ensure_member(dev_join)
                 except Exception as cache_e:
                     self.logger.debug(f"addPlayer snapshot cache prime failed: {cache_e}")
 
@@ -8598,27 +8604,26 @@ class SonosPlugin(object):
         ######################################################################################################################################################################################################
 
 
+            # Only refresh group plumbing when the EVENT's device is itself in
+            # a group. The previous any-group-anywhere test made every track
+            # tick on every player pay for track-info/artwork fetches plus a
+            # topology walk whenever any unrelated group existed in the house.
+            # Grouping *changes* arrive as ZGT events and are handled above.
             try:
-                any_grouped = any(
-                    str(dev.states.get("Grouped", "")).lower() == "true"
-                    for dev in indigo.devices.iter("self")
-                    if dev.enabled
-                )
+                this_grouped = str(indigo_device.states.get("Grouped", "")).lower() == "true"
             except Exception as e:
-                self.logger.warning(f"⚠️ Failed to evaluate 'Grouped' status across devices: {e}")
-                any_grouped = False
+                self.logger.debug(f"⚠️ Could not read Grouped for {indigo_device.name}: {e}")
+                this_grouped = False
 
-            if any_grouped:
+            if this_grouped:
                 soco_device = self.getSoCoDeviceByIP(indigo_device.address)
                 if soco_device:
                     self.refresh_group_membership(indigo_device, soco_device)
-                    #self.logger.info(f"🔁 Active group detected — forcing master/slave state updates for {indigo_device.name}")      
                     self.refresh_group_topology_after_plugin_zone_change()
-                    #self.evaluate_and_update_grouped_states()
                 else:
                     self.logger.warning(f"⚠️ Could not refresh group membership: No SoCo device for {indigo_device.name}")
             else:
-                self.logger.debug("⏩ No active groups (Grouped=true) detected — skipping group refresh/state sync")
+                self.logger.debug(f"⏩ {indigo_device.name} not grouped — skipping group refresh/state sync")
 
 
 
@@ -10174,9 +10179,17 @@ class SonosPlugin(object):
         # 🧠 Reset evaluated group tracking cache
         self.evaluated_group_members_by_coordinator = {}
 
-        for group_uid, group_data in self.zone_group_state_cache.items():
+        for group_uid, group_data in list(self.zone_group_state_cache.items()):
             coordinator_entry = group_data.get("coordinator")
             member_entries = group_data.get("members", [])
+
+            # Drop malformed cache entries (e.g. a friendly-name key with no
+            # coordinator, left by older cache-priming) — they pollute every
+            # evaluation pass with "No SoCo found for UUID None" noise.
+            if not coordinator_entry and not str(group_uid).startswith("RINCON"):
+                self.logger.debug(f"🧹 Removing malformed cached group entry '{group_uid}'")
+                self.zone_group_state_cache.pop(group_uid, None)
+                continue
 
             self.logger.debug(f"🧪 Group ID: {group_uid} | Coordinator: {coordinator_entry} | Members: {len(member_entries)}")
 
@@ -11387,6 +11400,17 @@ class SonosPlugin(object):
             except Exception:
                 pass
 
+        # Dedupe: a track change fires several events (TRANSITIONING/PLAYING/
+        # metadata/volume) and each used to re-download the SAME artwork.
+        # Skip when this coordinator's art file already holds this URI.
+        if not hasattr(self, "_last_art_uri_by_coord"):
+            self._last_art_uri_by_coord = {}
+        if album_art_uri and \
+                self._last_art_uri_by_coord.get(coord_ip) == album_art_uri and \
+                os.path.exists(master_art_path):
+            self.logger.debug(f"🎨 Artwork unchanged for {coord_ip} — skipping re-download")
+            album_art_uri = ""
+
         if album_art_uri:
             for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
                 try:
@@ -11397,6 +11421,7 @@ class SonosPlugin(object):
                         img.thumbnail((500, 500))
                         img = img.convert("RGB")
                         img.save(master_art_path, format="JPEG", quality=75)
+                        self._last_art_uri_by_coord[coord_ip] = album_art_uri
                         break
                 except Exception as e:
                     self.logger.debug(f"⚠️ Album art fetch failed: {e}")
@@ -11693,14 +11718,26 @@ class SonosPlugin(object):
                             value = uri_group + dev.states['ZP_LocalUID']
                         else:
                             value = dev.states[state]
+                        # Skip unchanged values — a track change fires several
+                        # events and re-pushing 18 identical states per slave
+                        # per event is pure Indigo-server churn.
+                        if rdev.states.get(state) == value:
+                            continue
                         if self.plugin.stateUpdatesDebug:
                             self.plugin.debugLog(u"\t Updating Slave Device: %s, State: %s, Value: %s" % (rdev.name, state, value))
                         rdev.updateStateOnServer(state, value)
-                    rdev.updateStateOnServer("ZP_ART", dev.states['ZP_ART'])
+                    if rdev.states.get("ZP_ART") != dev.states['ZP_ART']:
+                        rdev.updateStateOnServer("ZP_ART", dev.states['ZP_ART'])
+                    # ZP_ART is a fixed per-coordinator URL, so gate the file
+                    # copy on mtime (image content changes under the same URL).
                     try:
-                        shutil.copy2("/Library/Application Support/Perceptive Automation/images/Sonos/"+dev.states['ZP_ZoneName']+"_art.jpg", \
-                            "/Library/Application Support/Perceptive Automation/images/Sonos/"+rdev.states['ZP_ZoneName']+"_art.jpg")
-                    except:
+                        _art_dir = "/Library/Application Support/Perceptive Automation/images/Sonos/"
+                        _src = _art_dir + dev.states['ZP_ZoneName'] + "_art.jpg"
+                        _dst = _art_dir + rdev.states['ZP_ZoneName'] + "_art.jpg"
+                        if os.path.exists(_src) and (not os.path.exists(_dst)
+                                                     or os.path.getmtime(_src) > os.path.getmtime(_dst)):
+                            shutil.copy2(_src, _dst)
+                    except Exception:
                         pass
 
     def copyStateFromMaster(self, dev):
