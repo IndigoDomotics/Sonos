@@ -630,6 +630,9 @@
 					<Option value="MICROSOFT">Microsoft Translate</Option>
 				</List>
 			</Field>
+			<Field id="substitutionNote" type="label" fontColor="darkgray" fontSize="small" alignWithControl="false">
+				<Label>Message and Volume fields support Indigo substitutions — e.g. %%v:12345678%% (variable), %%d:12345678:stateId%% (device state), %%t:"%-I:%M %p"%% (time).</Label>
+			</Field>
 			<Field id="setting" type="textfield" visibleBindingId="ttsORfile" visibleBindingValue="TTS">
 				<Label>Message:</Label>
 			</Field>

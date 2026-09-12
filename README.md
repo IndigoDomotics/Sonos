@@ -132,7 +132,7 @@ Grouped players mirror the coordinator's enriched metadata states, so a control 
 - **Music sources**: Sonos Favourites, Sonos Playlists, RadioTime Favourite Stations, Sonos Radio, Pandora (+ Thumbs Up/Down), SiriusXM (+ channel list, test), Spotify/containers, Line-In, TV input, Play Queue
 - **Queue**: Clear, Save, Crossfade, Repeat / Repeat One / Toggle, Shuffle / Toggle
 - **Grouping**: Add player(s) to zone, Set standalone (one/all), with group-state resync
-- **Announcements**: file/MP3 announcements over the built-in HTTP server, with automatic ungroup → announce → regroup and state save/restore; Amazon Polly TTS supported
+- **Announcements**: file/MP3 announcements over the built-in HTTP server, with automatic ungroup → announce → regroup and state save/restore; text-to-speech via Amazon Polly (full voice range incl. generative), Apple Speech, and Google TTS. Message and volume fields support [Indigo substitutions](https://wiki.indigodomo.com/doku.php?id=indigo_2025.2_documentation:substitutions) — e.g. `%%v:12345678%%`, `%%d:12345678:stateId%%`, `%%t:"%-I:%M %p"%%` — so announcements can speak live variable values, device states, and timestamps
 - **Alarms**: enable/disable/toggle native Sonos alarms, optional volume override
 - **Utilities**: Save/Restore player states, Dump URI, group/topology diagnostic dumps (menu items)
 

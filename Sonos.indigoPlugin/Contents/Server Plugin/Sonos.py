@@ -7441,6 +7441,64 @@ class SonosPlugin(object):
             self.logger.error(f"❌ Error in _set_subscription_callback for {indigo_device.name} [{service_name}]: {e}")
 
 
+    def _on_subscription_renew_fail(self, exception):
+        """soco auto_renew_fail hook — runs on soco's renewal thread.
+
+        A failed renewal kills soco's auto-renew silently; without this hook
+        (and the periodic health check) the player stops sending events until
+        plugin restart — the classic "states stop updating after a few days".
+        Keep it to a log line; check_event_subscriptions() does the repair.
+        """
+        try:
+            self.logger.warning(f"🩺 A Sonos event subscription failed to renew ({exception}) — "
+                                f"will re-subscribe on the next health check")
+        except Exception:
+            pass
+
+    def check_event_subscriptions(self):
+        """Re-subscribe any device whose event subscriptions have expired.
+
+        Called periodically from plugin.py's runConcurrentThread. Cheap when
+        healthy: time_left is local arithmetic, no network. Only when a
+        subscription has actually lapsed (auto-renew died after a player
+        reboot / network blip) do we touch the network — and only if the
+        player answers a 1s probe.
+        """
+        subs_map = getattr(self, "soco_subs", None) or {}
+        for dev_id, subs in list(subs_map.items()):
+            try:
+                dev = indigo.devices[int(dev_id)]
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not dev.enabled or not subs:
+                continue
+            dead = []
+            for name, sub in list(subs.items()):
+                try:
+                    if sub.time_left <= 0:
+                        dead.append(name)
+                except Exception:
+                    # timeout=None (infinite lease) or odd state — treat as alive
+                    continue
+            if not dead:
+                continue
+            ip = (dev.pluginProps.get("address") or dev.address or "").strip()
+            if not ip or not self.is_host_reachable(ip, timeout=1.0):
+                self.logger.debug(f"🩺 {dev.name}: expired subscription(s) but player unreachable — will retry")
+                continue
+            self.logger.warning(f"🩺 {dev.name}: event subscription(s) expired ({', '.join(dead)}) — re-subscribing")
+            for name, sub in list(subs.items()):
+                try:
+                    sub.unsubscribe()
+                except Exception:
+                    pass
+            try:
+                soco_device = self.soco_by_ip.get(ip) or SoCo(ip)
+                self.soco_by_ip[ip] = soco_device
+                self.socoSubscribe(dev, soco_device)
+            except Exception as e:
+                self.logger.error(f"❌ Re-subscribe failed for {dev.name}: {e}")
+
     def socoSubscribe(self, indigo_device, soco_device):
         from soco.events import event_listener
 
@@ -7531,6 +7589,14 @@ class SonosPlugin(object):
             self.logger.debug(f"✅ Subscribed - Here !!!!! -  to ZoneGroupTopology | SID: {getattr(zgt_sub, 'sid', 'N/A')}, Callback: {getattr(zgt_sub.callback, '__name__', 'None')}")
         except Exception as e:
             self.logger.warning(f"⚠️ ZoneGroupTopology subscription failed for {indigo_device.name}: {e}")
+
+        # Flag failed auto-renewals immediately (the periodic health check
+        # does the actual re-subscribe; this callback runs on soco's thread).
+        for _svc, _sub in (self.soco_subs.get(indigo_device.id) or {}).items():
+            try:
+                _sub.auto_renew_fail = self._on_subscription_renew_fail
+            except Exception:
+                pass
 
         # Final Listener Check
         self.logger.debug(
@@ -12320,6 +12386,13 @@ class SonosPlugin(object):
 
             try:
                 response = requests.post(base_url + control_url, headers=headers, data=SoapMessage.encode("utf-8"), timeout=(5, 20))
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exception_error:
+                # A slow/offline player is a network condition, not a plugin
+                # fault — one concise warning (callers may add their own error
+                # via exception_handler, so keep this line short).
+                self.logger.warning(f"⏱️ {zoneIP} did not answer {soapAction} "
+                                    f"({type(exception_error).__name__}) — player offline or busy")
+                raise
             except Exception as exception_error:
                 self.logger.error(f"SOAPSend Error: {exception_error}")
                 raise
