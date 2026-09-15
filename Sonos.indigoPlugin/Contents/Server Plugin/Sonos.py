@@ -8543,13 +8543,26 @@ class SonosPlugin(object):
                     return ""
 
 
+            # A grouped SLAVE's own AVTransport "plays" the x-rincon link stream
+            # from its coordinator, and that link reports PLAYING regardless of
+            # whether the coordinator is producing audio — a slave's transport
+            # state is meaningless (seen live: coordinator STOPPED, slaves'
+            # transports PLAYING → devices stuck "playing" with nothing on).
+            # Slaves get their real state from the coordinator's slave-sync.
+            _evt_track_uri = event_obj.variables.get("current_track_uri", "") or ""
+            _is_slave_link_event = isinstance(_evt_track_uri, str) and _evt_track_uri.startswith("x-rincon:")
+
             if "transport_state" in event_obj.variables:
-                transport_state = event_obj.variables["transport_state"]
-                transport_state_upper = transport_state.upper()
-                state_updates["ZP_STATE"] = transport_state_upper
-                indigo_device.updateStateOnServer(key="State", value=transport_state_upper)
-                indigo_device.updateStateOnServer(key="ZP_STATE", value=transport_state_upper)
-                self.logger.debug(f"🔄 Updated State and ZP_STATE from event: {transport_state_upper}")
+                if _is_slave_link_event:
+                    self.logger.debug(f"⏩ Ignoring transport state from slave link stream for {indigo_device.name} "
+                                      f"(state follows its coordinator)")
+                else:
+                    transport_state = event_obj.variables["transport_state"]
+                    transport_state_upper = transport_state.upper()
+                    state_updates["ZP_STATE"] = transport_state_upper
+                    indigo_device.updateStateOnServer(key="State", value=transport_state_upper)
+                    indigo_device.updateStateOnServer(key="ZP_STATE", value=transport_state_upper)
+                    self.logger.debug(f"🔄 Updated State and ZP_STATE from event: {transport_state_upper}")
 
             if not hasattr(self, "last_siriusxm_track_by_dev"):
                 self.last_siriusxm_track_by_dev = {}
@@ -11020,6 +11033,28 @@ class SonosPlugin(object):
             is_coordinator = (coordinator_ip == indigo_device.address.strip())
             #self.trace_me(indigo_device)
             current_group_name = coordinator.player_name or ""
+
+            # soco's per-player .group view can be STALE (seen live: a slave
+            # believed itself coordinator and its own transport was read as
+            # "PLAYING" while the real coordinator was STOPPED). The player's
+            # own CurrentURI is authoritative: x-rincon:<uid> == slave of <uid>.
+            try:
+                mi = soco_device.avTransport.GetMediaInfo([("InstanceID", 0)])
+                cur_uri = (mi.get("CurrentURI") or "")
+            except Exception:
+                cur_uri = ""
+            if cur_uri.startswith("x-rincon:"):
+                real_coord_uid = cur_uri.split(":", 1)[1].strip()
+                real_coord = self.get_soco_by_uuid(real_coord_uid)
+                if real_coord is not None and is_coordinator:
+                    self.logger.debug(
+                        f"🧭 {indigo_device.name}: soco group view stale (claimed coordinator) — "
+                        f"CurrentURI shows slave of {getattr(real_coord, 'player_name', real_coord_uid)}")
+                if real_coord is not None:
+                    coordinator = real_coord
+                    coordinator_ip = (real_coord.ip_address or "").strip()
+                    current_group_name = getattr(real_coord, "player_name", "") or current_group_name
+                is_coordinator = False
 
             # Update coordinator and group name state
             indigo_device.updateStateOnServer("GROUP_Coordinator", str(is_coordinator).lower())

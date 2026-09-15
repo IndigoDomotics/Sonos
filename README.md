@@ -2,7 +2,7 @@
 
 Control your entire Sonos system from [Indigo](https://www.indigodomo.com) — playback, volume, grouping, favourites, streaming services, announcements, soundbar tuning, and native Sonos alarms — as first-class Indigo devices, actions, and triggers.
 
-**Current version: 2025.2.7** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
+**Current version: 2025.2.8** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
 
 ---
 
@@ -145,6 +145,8 @@ Grouped players mirror the coordinator's enriched metadata states, so a control 
 - **Menu → dump options** — group topology, subscribed devices, and SiriusXM channel dumps are available as diagnostic aids under the plugin menu.
 
 ## Version history
+
+**2025.2.8** — Grouped players no longer show a phantom "playing" state. A grouped slave's own transport reports PLAYING for its link stream to the coordinator regardless of whether any audio is playing — the plugin now ignores slave link-stream transport events (a slave's state follows its coordinator) and verifies coordinatorship against the player's authoritative CurrentURI instead of soco's per-player group view, which can go stale.
 
 **2025.2.7** — Event-subscription watchdog: device states no longer freeze after a failed subscription renewal (the cause of "states stop updating after a few days until a plugin restart") — lapsed subscriptions are detected within a minute and re-subscribed automatically, with a log warning the moment a renewal fails. Major reduction in per-event overhead: group refresh now runs only for the player the event came from (not whenever any group existed anywhere), identical album art is no longer re-downloaded several times per track change, unchanged states are no longer re-pushed to grouped slaves, and a malformed cached group entry that polluted every evaluation pass is cleaned up. Announcement/action dialogs now advertise Indigo substitution support (always worked; now documented). Slow/offline players log one concise warning instead of a two-part error.
 
