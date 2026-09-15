@@ -1914,28 +1914,34 @@ class SonosPlugin(object):
                         if all(x.id != d.id for x in self.evaluated_group_members_by_coordinator[group_friendly]):
                             self.evaluated_group_members_by_coordinator[group_friendly].append(d)
 
-                    # 2) zone_group_state_cache: ensure coordinator+members are represented
+                    # 2) zone_group_state_cache: ensure coordinator+members are represented.
+                    # Only prime under a real RINCON group uid — a friendly-name
+                    # key with no coordinator lingers as a malformed entry that
+                    # pollutes every later evaluation pass.
                     self.zone_group_state_cache = getattr(self, "zone_group_state_cache", {}) or {}
                     grp_uid = None
                     if coord_soco and getattr(coord_soco, "group", None):
                         grp_uid = getattr(coord_soco.group, "uid", None)
-                    cache_key = grp_uid or group_friendly
-                    entry = self.zone_group_state_cache.setdefault(cache_key, {"coordinator": None, "members": []})
+                    if not grp_uid:
+                        # evaluate pass will pick topology up from the next ZGT
+                        self.logger.debug("addPlayer cache prime skipped: no group uid available yet")
+                    else:
+                        entry = self.zone_group_state_cache.setdefault(grp_uid, {"coordinator": None, "members": []})
 
-                    if coord_soco and getattr(coord_soco, "uid", None):
-                        entry["coordinator"] = coord_soco.uid
+                        if coord_soco and getattr(coord_soco, "uid", None):
+                            entry["coordinator"] = coord_soco.uid
 
-                    def _ensure_member(dev_obj):
-                        ip = (dev_obj.pluginProps.get("address", "") or "").strip()
-                        soco = self.soco_by_ip.get(ip)
-                        uuid = getattr(soco, "uid", None)
-                        name = dev_obj.states.get("GROUP_Name") or dev_obj.name
-                        # Store as dicts; evaluator handles dict members
-                        if uuid and not any((m.get("uuid") if isinstance(m, dict) else m) == uuid for m in entry["members"]):
-                            entry["members"].append({"uuid": uuid, "ip": ip, "name": name})
+                        def _ensure_member(dev_obj):
+                            ip = (dev_obj.pluginProps.get("address", "") or "").strip()
+                            soco = self.soco_by_ip.get(ip)
+                            uuid = getattr(soco, "uid", None)
+                            name = dev_obj.states.get("GROUP_Name") or dev_obj.name
+                            # Store as dicts; evaluator handles dict members
+                            if uuid and not any((m.get("uuid") if isinstance(m, dict) else m) == uuid for m in entry["members"]):
+                                entry["members"].append({"uuid": uuid, "ip": ip, "name": name})
 
-                    _ensure_member(dev_coord)
-                    _ensure_member(dev_join)
+                        _ensure_member(dev_coord)
+                        _ensure_member(dev_join)
                 except Exception as cache_e:
                     self.logger.debug(f"addPlayer snapshot cache prime failed: {cache_e}")
 
@@ -7441,6 +7447,64 @@ class SonosPlugin(object):
             self.logger.error(f"❌ Error in _set_subscription_callback for {indigo_device.name} [{service_name}]: {e}")
 
 
+    def _on_subscription_renew_fail(self, exception):
+        """soco auto_renew_fail hook — runs on soco's renewal thread.
+
+        A failed renewal kills soco's auto-renew silently; without this hook
+        (and the periodic health check) the player stops sending events until
+        plugin restart — the classic "states stop updating after a few days".
+        Keep it to a log line; check_event_subscriptions() does the repair.
+        """
+        try:
+            self.logger.warning(f"🩺 A Sonos event subscription failed to renew ({exception}) — "
+                                f"will re-subscribe on the next health check")
+        except Exception:
+            pass
+
+    def check_event_subscriptions(self):
+        """Re-subscribe any device whose event subscriptions have expired.
+
+        Called periodically from plugin.py's runConcurrentThread. Cheap when
+        healthy: time_left is local arithmetic, no network. Only when a
+        subscription has actually lapsed (auto-renew died after a player
+        reboot / network blip) do we touch the network — and only if the
+        player answers a 1s probe.
+        """
+        subs_map = getattr(self, "soco_subs", None) or {}
+        for dev_id, subs in list(subs_map.items()):
+            try:
+                dev = indigo.devices[int(dev_id)]
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not dev.enabled or not subs:
+                continue
+            dead = []
+            for name, sub in list(subs.items()):
+                try:
+                    if sub.time_left <= 0:
+                        dead.append(name)
+                except Exception:
+                    # timeout=None (infinite lease) or odd state — treat as alive
+                    continue
+            if not dead:
+                continue
+            ip = (dev.pluginProps.get("address") or dev.address or "").strip()
+            if not ip or not self.is_host_reachable(ip, timeout=1.0):
+                self.logger.debug(f"🩺 {dev.name}: expired subscription(s) but player unreachable — will retry")
+                continue
+            self.logger.warning(f"🩺 {dev.name}: event subscription(s) expired ({', '.join(dead)}) — re-subscribing")
+            for name, sub in list(subs.items()):
+                try:
+                    sub.unsubscribe()
+                except Exception:
+                    pass
+            try:
+                soco_device = self.soco_by_ip.get(ip) or SoCo(ip)
+                self.soco_by_ip[ip] = soco_device
+                self.socoSubscribe(dev, soco_device)
+            except Exception as e:
+                self.logger.error(f"❌ Re-subscribe failed for {dev.name}: {e}")
+
     def socoSubscribe(self, indigo_device, soco_device):
         from soco.events import event_listener
 
@@ -7531,6 +7595,14 @@ class SonosPlugin(object):
             self.logger.debug(f"✅ Subscribed - Here !!!!! -  to ZoneGroupTopology | SID: {getattr(zgt_sub, 'sid', 'N/A')}, Callback: {getattr(zgt_sub.callback, '__name__', 'None')}")
         except Exception as e:
             self.logger.warning(f"⚠️ ZoneGroupTopology subscription failed for {indigo_device.name}: {e}")
+
+        # Flag failed auto-renewals immediately (the periodic health check
+        # does the actual re-subscribe; this callback runs on soco's thread).
+        for _svc, _sub in (self.soco_subs.get(indigo_device.id) or {}).items():
+            try:
+                _sub.auto_renew_fail = self._on_subscription_renew_fail
+            except Exception:
+                pass
 
         # Final Listener Check
         self.logger.debug(
@@ -8471,13 +8543,26 @@ class SonosPlugin(object):
                     return ""
 
 
+            # A grouped SLAVE's own AVTransport "plays" the x-rincon link stream
+            # from its coordinator, and that link reports PLAYING regardless of
+            # whether the coordinator is producing audio — a slave's transport
+            # state is meaningless (seen live: coordinator STOPPED, slaves'
+            # transports PLAYING → devices stuck "playing" with nothing on).
+            # Slaves get their real state from the coordinator's slave-sync.
+            _evt_track_uri = event_obj.variables.get("current_track_uri", "") or ""
+            _is_slave_link_event = isinstance(_evt_track_uri, str) and _evt_track_uri.startswith("x-rincon:")
+
             if "transport_state" in event_obj.variables:
-                transport_state = event_obj.variables["transport_state"]
-                transport_state_upper = transport_state.upper()
-                state_updates["ZP_STATE"] = transport_state_upper
-                indigo_device.updateStateOnServer(key="State", value=transport_state_upper)
-                indigo_device.updateStateOnServer(key="ZP_STATE", value=transport_state_upper)
-                self.logger.debug(f"🔄 Updated State and ZP_STATE from event: {transport_state_upper}")
+                if _is_slave_link_event:
+                    self.logger.debug(f"⏩ Ignoring transport state from slave link stream for {indigo_device.name} "
+                                      f"(state follows its coordinator)")
+                else:
+                    transport_state = event_obj.variables["transport_state"]
+                    transport_state_upper = transport_state.upper()
+                    state_updates["ZP_STATE"] = transport_state_upper
+                    indigo_device.updateStateOnServer(key="State", value=transport_state_upper)
+                    indigo_device.updateStateOnServer(key="ZP_STATE", value=transport_state_upper)
+                    self.logger.debug(f"🔄 Updated State and ZP_STATE from event: {transport_state_upper}")
 
             if not hasattr(self, "last_siriusxm_track_by_dev"):
                 self.last_siriusxm_track_by_dev = {}
@@ -8532,27 +8617,26 @@ class SonosPlugin(object):
         ######################################################################################################################################################################################################
 
 
+            # Only refresh group plumbing when the EVENT's device is itself in
+            # a group. The previous any-group-anywhere test made every track
+            # tick on every player pay for track-info/artwork fetches plus a
+            # topology walk whenever any unrelated group existed in the house.
+            # Grouping *changes* arrive as ZGT events and are handled above.
             try:
-                any_grouped = any(
-                    str(dev.states.get("Grouped", "")).lower() == "true"
-                    for dev in indigo.devices.iter("self")
-                    if dev.enabled
-                )
+                this_grouped = str(indigo_device.states.get("Grouped", "")).lower() == "true"
             except Exception as e:
-                self.logger.warning(f"⚠️ Failed to evaluate 'Grouped' status across devices: {e}")
-                any_grouped = False
+                self.logger.debug(f"⚠️ Could not read Grouped for {indigo_device.name}: {e}")
+                this_grouped = False
 
-            if any_grouped:
+            if this_grouped:
                 soco_device = self.getSoCoDeviceByIP(indigo_device.address)
                 if soco_device:
                     self.refresh_group_membership(indigo_device, soco_device)
-                    #self.logger.info(f"🔁 Active group detected — forcing master/slave state updates for {indigo_device.name}")      
                     self.refresh_group_topology_after_plugin_zone_change()
-                    #self.evaluate_and_update_grouped_states()
                 else:
                     self.logger.warning(f"⚠️ Could not refresh group membership: No SoCo device for {indigo_device.name}")
             else:
-                self.logger.debug("⏩ No active groups (Grouped=true) detected — skipping group refresh/state sync")
+                self.logger.debug(f"⏩ {indigo_device.name} not grouped — skipping group refresh/state sync")
 
 
 
@@ -10108,9 +10192,17 @@ class SonosPlugin(object):
         # 🧠 Reset evaluated group tracking cache
         self.evaluated_group_members_by_coordinator = {}
 
-        for group_uid, group_data in self.zone_group_state_cache.items():
+        for group_uid, group_data in list(self.zone_group_state_cache.items()):
             coordinator_entry = group_data.get("coordinator")
             member_entries = group_data.get("members", [])
+
+            # Drop malformed cache entries (e.g. a friendly-name key with no
+            # coordinator, left by older cache-priming) — they pollute every
+            # evaluation pass with "No SoCo found for UUID None" noise.
+            if not coordinator_entry and not str(group_uid).startswith("RINCON"):
+                self.logger.debug(f"🧹 Removing malformed cached group entry '{group_uid}'")
+                self.zone_group_state_cache.pop(group_uid, None)
+                continue
 
             self.logger.debug(f"🧪 Group ID: {group_uid} | Coordinator: {coordinator_entry} | Members: {len(member_entries)}")
 
@@ -10942,6 +11034,28 @@ class SonosPlugin(object):
             #self.trace_me(indigo_device)
             current_group_name = coordinator.player_name or ""
 
+            # soco's per-player .group view can be STALE (seen live: a slave
+            # believed itself coordinator and its own transport was read as
+            # "PLAYING" while the real coordinator was STOPPED). The player's
+            # own CurrentURI is authoritative: x-rincon:<uid> == slave of <uid>.
+            try:
+                mi = soco_device.avTransport.GetMediaInfo([("InstanceID", 0)])
+                cur_uri = (mi.get("CurrentURI") or "")
+            except Exception:
+                cur_uri = ""
+            if cur_uri.startswith("x-rincon:"):
+                real_coord_uid = cur_uri.split(":", 1)[1].strip()
+                real_coord = self.get_soco_by_uuid(real_coord_uid)
+                if real_coord is not None and is_coordinator:
+                    self.logger.debug(
+                        f"🧭 {indigo_device.name}: soco group view stale (claimed coordinator) — "
+                        f"CurrentURI shows slave of {getattr(real_coord, 'player_name', real_coord_uid)}")
+                if real_coord is not None:
+                    coordinator = real_coord
+                    coordinator_ip = (real_coord.ip_address or "").strip()
+                    current_group_name = getattr(real_coord, "player_name", "") or current_group_name
+                is_coordinator = False
+
             # Update coordinator and group name state
             indigo_device.updateStateOnServer("GROUP_Coordinator", str(is_coordinator).lower())
             indigo_device.updateStateOnServer("GROUP_Name", current_group_name)
@@ -11321,6 +11435,17 @@ class SonosPlugin(object):
             except Exception:
                 pass
 
+        # Dedupe: a track change fires several events (TRANSITIONING/PLAYING/
+        # metadata/volume) and each used to re-download the SAME artwork.
+        # Skip when this coordinator's art file already holds this URI.
+        if not hasattr(self, "_last_art_uri_by_coord"):
+            self._last_art_uri_by_coord = {}
+        if album_art_uri and \
+                self._last_art_uri_by_coord.get(coord_ip) == album_art_uri and \
+                os.path.exists(master_art_path):
+            self.logger.debug(f"🎨 Artwork unchanged for {coord_ip} — skipping re-download")
+            album_art_uri = ""
+
         if album_art_uri:
             for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
                 try:
@@ -11331,6 +11456,7 @@ class SonosPlugin(object):
                         img.thumbnail((500, 500))
                         img = img.convert("RGB")
                         img.save(master_art_path, format="JPEG", quality=75)
+                        self._last_art_uri_by_coord[coord_ip] = album_art_uri
                         break
                 except Exception as e:
                     self.logger.debug(f"⚠️ Album art fetch failed: {e}")
@@ -11627,14 +11753,26 @@ class SonosPlugin(object):
                             value = uri_group + dev.states['ZP_LocalUID']
                         else:
                             value = dev.states[state]
+                        # Skip unchanged values — a track change fires several
+                        # events and re-pushing 18 identical states per slave
+                        # per event is pure Indigo-server churn.
+                        if rdev.states.get(state) == value:
+                            continue
                         if self.plugin.stateUpdatesDebug:
                             self.plugin.debugLog(u"\t Updating Slave Device: %s, State: %s, Value: %s" % (rdev.name, state, value))
                         rdev.updateStateOnServer(state, value)
-                    rdev.updateStateOnServer("ZP_ART", dev.states['ZP_ART'])
+                    if rdev.states.get("ZP_ART") != dev.states['ZP_ART']:
+                        rdev.updateStateOnServer("ZP_ART", dev.states['ZP_ART'])
+                    # ZP_ART is a fixed per-coordinator URL, so gate the file
+                    # copy on mtime (image content changes under the same URL).
                     try:
-                        shutil.copy2("/Library/Application Support/Perceptive Automation/images/Sonos/"+dev.states['ZP_ZoneName']+"_art.jpg", \
-                            "/Library/Application Support/Perceptive Automation/images/Sonos/"+rdev.states['ZP_ZoneName']+"_art.jpg")
-                    except:
+                        _art_dir = "/Library/Application Support/Perceptive Automation/images/Sonos/"
+                        _src = _art_dir + dev.states['ZP_ZoneName'] + "_art.jpg"
+                        _dst = _art_dir + rdev.states['ZP_ZoneName'] + "_art.jpg"
+                        if os.path.exists(_src) and (not os.path.exists(_dst)
+                                                     or os.path.getmtime(_src) > os.path.getmtime(_dst)):
+                            shutil.copy2(_src, _dst)
+                    except Exception:
                         pass
 
     def copyStateFromMaster(self, dev):
@@ -12320,6 +12458,13 @@ class SonosPlugin(object):
 
             try:
                 response = requests.post(base_url + control_url, headers=headers, data=SoapMessage.encode("utf-8"), timeout=(5, 20))
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exception_error:
+                # A slow/offline player is a network condition, not a plugin
+                # fault — one concise warning (callers may add their own error
+                # via exception_handler, so keep this line short).
+                self.logger.warning(f"⏱️ {zoneIP} did not answer {soapAction} "
+                                    f"({type(exception_error).__name__}) — player offline or busy")
+                raise
             except Exception as exception_error:
                 self.logger.error(f"SOAPSend Error: {exception_error}")
                 raise

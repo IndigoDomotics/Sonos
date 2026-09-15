@@ -397,6 +397,13 @@ class Plugin(indigo.PluginBase):
                         self.Sonos.retry_deferred_devices()
                     except Exception as exception_error:
                         self.exception_handler(exception_error, True)
+                    # Re-subscribe any lapsed event subscriptions — a failed
+                    # auto-renew otherwise silences a player's events until
+                    # plugin restart ("states stop updating after a few days").
+                    try:
+                        self.Sonos.check_event_subscriptions()
+                    except Exception as exception_error:
+                        self.exception_handler(exception_error, True)
                 self.sleep(60.0)
         except self.StopThread:
             pass
