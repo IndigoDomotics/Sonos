@@ -6,12 +6,29 @@ Control your entire Sonos system from [Indigo](https://www.indigodomo.com) — p
 
 ---
 
-## What's new in 2025.2.5
+## What's new in 2025.2.9
 
-Two field-reported fixes on top of the 2025.2.4 announcement overhaul:
+This release makes the plugin fully self-healing around unreachable players — powered off, dropped off WiFi, or moved to a new IP address — and closes a long-standing event-subscription gap that could freeze a group's playback state.
 
-- **Volume/mute/EQ actions on a grouped player now adjust that player, not the group master.** Triggering Volume Up/Down (or Mute, Bass, Treble, or any soundbar EQ action) against a zone that was grouped as a slave used to be redirected to the group coordinator. These are per-player settings — each Sonos keeps its own volume while grouped — so they now always target the device the action names. To change a whole group's volume, use the Group Volume / Group Mute actions as before.
-- **No more warnings for bonded speakers after announcements.** Zones with bonded satellites (e.g. a Beam with surround speakers and a Sub) logged harmless "could not re-join" warnings when the announcement restore tried to re-group the satellites — they never leave their bond and don't accept grouping commands. They're now excluded from the restore step.
+### Players that die or move are detected and recovered automatically
+
+- **Runtime offline detection.** Previously, self-healing only covered players that were offline when the plugin *started*. A player that died or changed IP address mid-run (the classic case: a router restart re-deals every DHCP lease at once) produced endless "No route to host" errors until you restarted the plugin. Now an active liveness sweep probes every player each minute — costing milliseconds for live players — so a dead player is detected within ~3 minutes even on a completely idle system, and immediately when commands are failing.
+- **Honest states for dead players.** A detected-offline player is marked `offline` with its playback state set to STOPPED — a powered-off player can no longer sit showing "playing", and a grouped coordinator no longer stamps its own playing state onto an offline group member.
+- **Automatic recovery, including new IP addresses.** Offline players are retried in the background: the moment one answers again it's brought back with fresh event subscriptions, and if it reappears at a *different* IP address it's re-found by its Sonos ID and the Indigo device's address is updated automatically — no delete-and-recreate, no control-page edits.
+- **Quiet logs while a player is down.** Topology refreshes skip unreachable players instead of stalling 5–10 seconds per call and flooding the Event Log; all unreachable-player conditions log one concise warning line.
+
+### Event subscriptions for every player
+
+The plugin only subscribed to transport events for players that were *group coordinators at startup*. A player that started as a group member — or recovered from offline with a stale state — and was later made coordinator of a new group never delivered its "playing" events, so the whole group's states froze at STOPPED. Every player (except bonded satellites like Subs and surrounds) is now subscribed, matching Home Assistant's approach — group role changes at any time just work, and grouped players now receive their own volume events too.
+
+### Recent releases at a glance
+
+- **2025.2.8** — grouped players no longer show a phantom "playing" state from their link stream to the coordinator.
+- **2025.2.7** — event-subscription watchdog (states no longer freeze after a failed renewal — the old "works for days, then stops until restart") and a ~10x cut in per-event processing overhead.
+- **2025.2.6** — Amazon Polly announcements fully repaired (four stacked bugs, some dating to 2024.0.8) and expanded to Amazon's complete voice range, including neural and generative voices, selectable per engine tier in the Voice menu.
+- **2025.2.5** — volume/mute/EQ actions on a grouped player adjust *that player*, not the group master; bonded satellites excluded from announcement group-restore.
+
+Full details for every release are in the [version history](#version-history) below.
 
 ---
 
