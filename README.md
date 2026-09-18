@@ -2,7 +2,7 @@
 
 Control your entire Sonos system from [Indigo](https://www.indigodomo.com) — playback, volume, grouping, favourites, streaming services, announcements, soundbar tuning, and native Sonos alarms — as first-class Indigo devices, actions, and triggers.
 
-**Current version: 2025.2.8** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
+**Current version: 2025.2.9** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
 
 ---
 
@@ -145,6 +145,8 @@ Grouped players mirror the coordinator's enriched metadata states, so a control 
 - **Menu → dump options** — group topology, subscribed devices, and SiriusXM channel dumps are available as diagnostic aids under the plugin menu.
 
 ## Version history
+
+**2025.2.9** — Runtime offline detection and self-healing: a player that becomes unreachable *while the plugin is running* — powered off, dropped off WiFi, or moved to a new DHCP address (e.g. after a router restart re-deals every lease) — is now detected within ~3 minutes even on an idle system (an active liveness probe sweeps all players every minute; failed commands accelerate detection), marked `offline` with its state set to STOPPED, and handed to the background recovery loop, which reconnects when it returns or re-finds it by its Sonos ID at its new address automatically. An offline grouped player no longer inherits its coordinator's "playing" state, topology refreshes skip unreachable players instead of stalling and flooding the log, and soco-internal fetch failures log one concise warning. **Event subscriptions are now established for every player** (not only group coordinators at startup) — previously a player that was a group slave when the plugin started never received transport events, so if it later became a group's coordinator, that group's playback state froze at STOPPED. DHCP reservations for your players remain best practice.
 
 **2025.2.8** — Grouped players no longer show a phantom "playing" state. A grouped slave's own transport reports PLAYING for its link stream to the coordinator regardless of whether any audio is playing — the plugin now ignores slave link-stream transport events (a slave's state follows its coordinator) and verifies coordinatorship against the player's authoritative CurrentURI instead of soco's per-player group view, which can go stale.
 

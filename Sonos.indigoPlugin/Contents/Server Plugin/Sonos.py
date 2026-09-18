@@ -7534,12 +7534,20 @@ class SonosPlugin(object):
 
         def _subscribe_with_retry(service_attr, service_name):
             try:
-                # Determine suppression before subscribing
-                is_coordinator = indigo_device.states.get("GROUP_Coordinator", False) in [True, "true", "True"]
+                # Skip only bonded satellites (Sub/surrounds/Boost) — they never
+                # carry useful transport/rendering state. Every OTHER player is
+                # subscribed regardless of its CURRENT group role: a slave can
+                # become coordinator at any moment (user builds a new group in
+                # the app), and without an AVTransport subscription its PLAYING
+                # would never arrive — devices froze at STOPPED. The old
+                # non-coordinator skip was masked by the pre-2025.2.7 refresh
+                # that polled coordinators on every event from any player;
+                # phantom slave-state is prevented separately by the
+                # x-rincon link-stream filter in the event handler.
                 bonded_keywords = ["sub", "surround", "boost"]
                 is_bonded = any(kw in model_name.lower() for kw in bonded_keywords)
-                if not is_coordinator or is_bonded:
-                    self.logger.debug(f"ℹ️ Skipping {service_name} subscription for {indigo_device.name} (bonded or non-coordinator)")
+                if is_bonded:
+                    self.logger.debug(f"ℹ️ Skipping {service_name} subscription for {indigo_device.name} (bonded satellite)")
                     return
 
                 self.logger.debug(f"🔔 Initiating subscription to {service_name} for {indigo_device.name}")
@@ -7693,6 +7701,118 @@ class SonosPlugin(object):
         except Exception as e:
             self.logger.debug(f"safe_uid: could not fetch UID from {ip}: {e}")
             return None
+
+    def _log_net_or_error(self, context, exception_error):
+        """Log helper for paths that talk to players via soco/requests directly.
+
+        Connection-class failures (dead/moved player) become ONE concise
+        warning and feed runtime offline detection — soco's internal fetches
+        (e.g. its lazy /xml/<Service>1.xml schema load, hardcoded timeout=10)
+        bypass SOAPSend, so without this they neither get counted nor logged
+        tersely. Anything else stays a real error.
+        """
+        if isinstance(exception_error, requests.exceptions.RequestException):
+            ip = None
+            try:
+                m = re.search(r"host='([0-9.]+)'", str(exception_error))
+                ip = m.group(1) if m else None
+            except Exception:
+                pass
+            if ip and not isinstance(exception_error, requests.exceptions.ReadTimeout):
+                self._note_conn_failure(ip)
+            where = f" ({ip})" if ip else ""
+            self.logger.warning(f"⏱️ {context}: player unreachable{where} — {type(exception_error).__name__}")
+        else:
+            self.logger.error(f"❌ {context}: {exception_error}")
+
+    def _note_conn_failure(self, ip):
+        """Record a connection-level command failure against an IP.
+
+        Feeds runtime offline detection (check_unreachable_devices): repeated
+        no-route/refused failures mean the player is gone or has moved IP.
+        """
+        if not ip:
+            return
+        if not hasattr(self, "_conn_failures"):
+            self._conn_failures = {}
+        count, _ = self._conn_failures.get(ip, (0, 0.0))
+        self._conn_failures[ip] = (count + 1, time.time())
+
+    def _note_conn_success(self, ip):
+        """Any successful command clears the failure record for that IP."""
+        if getattr(self, "_conn_failures", None):
+            self._conn_failures.pop(ip, None)
+
+    def check_unreachable_devices(self):
+        """Runtime offline detection: extend the startup self-heal to devices
+        that go unreachable WHILE RUNNING (forum case: router reboot re-dealt
+        DHCP leases — five players moved IP at once; the startup-only deferred
+        path never noticed because the devices had started fine).
+
+        Devices whose IP has racked up 3+ connection-level failures and still
+        fails a probe are marked offline and handed to the deferred-retry
+        path, which already reconnects when the player returns — or re-finds
+        it by RINCON id at its NEW address and updates the device.
+
+        Called every 60s from plugin.py's runConcurrentThread.
+
+        Detection cannot rely on command failures alone: an idle dead player
+        receives no commands (probe-gating deliberately skips it), sends no
+        events, and would otherwise sit "playing" forever. So each cycle also
+        ACTIVELY probes every enabled online device — a reachable player
+        answers a LAN TCP connect in milliseconds; only dead ones cost the 1s
+        timeout. Three failed cycles (or any mix with failed commands) marks
+        the device offline.
+        """
+        if not hasattr(self, "_conn_failures"):
+            self._conn_failures = {}
+        failures = self._conn_failures
+        # Active liveness sweep — the guaranteed detection path for idle players
+        for d in indigo.devices.iter("com.ssi.indigoplugin.Sonos"):
+            if not d.enabled or d.id in (getattr(self, "deferred_start_devices", None) or set()):
+                continue
+            ip = (d.pluginProps.get("address") or d.address or "").strip()
+            if ip and not self.is_host_reachable(ip, timeout=1.0):
+                self._note_conn_failure(ip)
+        if not failures:
+            return
+        now = time.time()
+        for ip, (count, last_ts) in list(failures.items()):
+            if now - last_ts > 600.0:
+                failures.pop(ip, None)  # stale — no recent trouble
+                continue
+            if count < 3:
+                continue
+            if self.is_host_reachable(ip, timeout=1.0):
+                failures.pop(ip, None)  # transient blip; player answers again
+                continue
+            dev = (getattr(self, "ip_to_indigo_device", {}) or {}).get(ip)
+            if dev is None:
+                for d in indigo.devices.iter("com.ssi.indigoplugin.Sonos"):
+                    if (d.pluginProps.get("address") or d.address or "").strip() == ip:
+                        dev = d
+                        break
+            failures.pop(ip, None)
+            if dev is None or not dev.enabled:
+                continue
+            if not hasattr(self, "deferred_start_devices"):
+                self.deferred_start_devices = set()
+            if dev.id in self.deferred_start_devices:
+                continue
+            self.logger.warning(
+                f"📴 {dev.name} ({ip}) is unreachable after {count} failed commands — "
+                f"marking offline; will reconnect when it returns, or re-find it by its "
+                f"Sonos ID if its IP changed (e.g. after a router/DHCP restart).")
+            try:
+                # A dead player cannot be playing — clear phantom transport
+                # state (it may have been a grouped slave still carrying the
+                # coordinator's PLAYING from slave-sync).
+                dev.updateStateOnServer("ZP_STATE", "STOPPED")
+                dev.updateStateOnServer("State", "STOPPED")
+                dev.setErrorStateOnServer("offline")
+            except Exception:
+                pass
+            self.deferred_start_devices.add(dev.id)
 
     def retry_deferred_devices(self):
         """Retry startup for devices that were offline when deviceStartComm ran.
@@ -9426,7 +9546,7 @@ class SonosPlugin(object):
             try:
                 self.dump_groups_to_log()
             except Exception as e:
-                self.logger.error(f"❌ dump_groups_to_log failed: {e}")
+                self._log_net_or_error("dump_groups_to_log", e)
             finally:
                 # Mark as done so subsequent calls won't reschedule.
                 self._dump_groups_done = True
@@ -9667,7 +9787,7 @@ class SonosPlugin(object):
             # Confirm group/coordinator exists
             group = getattr(soco_device, "group", None)
             if not group or not hasattr(group, "coordinator"):
-                self.logger.warning(f"⚠️ SoCo device {zone_ip} has no group or coordinator info — using self.")
+                self.logger.debug(f"⚠️ SoCo device {zone_ip} has no group or coordinator info — using self.")
                 return device
 
             coordinator = group.coordinator
@@ -11011,7 +11131,7 @@ class SonosPlugin(object):
             self.evaluate_and_update_grouped_states()
 
         except Exception as e:
-            self.logger.error(f"❌ Exception in refresh_group_topology_after_plugin_zone_change: {e}")
+            self._log_net_or_error("refresh_group_topology_after_plugin_zone_change", e)
 
 
 
@@ -11026,6 +11146,11 @@ class SonosPlugin(object):
     def refresh_group_membership(self, indigo_device, soco_device):
         try:
             group = soco_device.group
+            # Right after a player reboots, soco can briefly have no group
+            # info at all — skip quietly rather than crash on .coordinator.
+            if group is None or getattr(group, "coordinator", None) is None:
+                self.logger.debug(f"⏳ {indigo_device.name}: no soco group info yet — skipping membership refresh")
+                return
             coordinator = group.coordinator
             devices_in_group = group.members
 
@@ -11099,6 +11224,11 @@ class SonosPlugin(object):
 
             else:
                 # === Sync slave states from coordinator device ===
+                # Not for offline devices — a powered-off slave must not
+                # inherit the coordinator's PLAYING.
+                if indigo_device.id in (getattr(self, "deferred_start_devices", None) or set()):
+                    self.safe_debug(f"📴 Skipping slave sync for offline {indigo_device.name}")
+                    return
                 master_dev = next(
                     (dev for dev in indigo.devices if dev.address.strip() == coordinator_ip),
                     None
@@ -11746,6 +11876,11 @@ class SonosPlugin(object):
             for rdev in indigo.devices.iter("self.ZonePlayer"):
                 SlaveUID = rdev.states['ZP_LocalUID']
                 GROUP_Coordinator = rdev.states['GROUP_Coordinator']
+                # An offline slave must not inherit the coordinator's PLAYING —
+                # a powered-off player showing "playing" until the group's
+                # topology catches up (runtime offline detection marked it).
+                if rdev.id in (getattr(self, "deferred_start_devices", None) or set()):
+                    continue
                 # Do not update if you are yourself, not a slave, and not in the group
                 if SlaveUID != dev.states['ZP_LocalUID'] and GROUP_Coordinator == "false" and SlaveUID in ZonePlayerUUIDsInGroup:
                     for state in list(ZoneGroupStates):
@@ -11953,6 +12088,13 @@ class SonosPlugin(object):
 
     def updateZoneGroupStates(self, dev):
         zoneIP = dev.pluginProps["address"]
+        # Cached 1s probe (30s negative TTL): this runs for EVERY device on
+        # every ZGT propagation pass — an unreachable player must not stall
+        # each pass 5s and spam timeouts (a vanishing player's topology churn
+        # generates many ZGT events in quick succession).
+        if not self._ip_probe_ok(zoneIP):
+            self.logger.debug(f"📴 updateZoneGroupStates: skipping unreachable {dev.name} ({zoneIP})")
+            return
         res = self.SOAPSend(zoneIP, "/ZonePlayer", "/ZoneGroupTopology", "GetZoneGroupAttributes", "")
 
         # ✅ Removed .decode('utf-8') – not needed in Python 3
@@ -12464,11 +12606,17 @@ class SonosPlugin(object):
                 # via exception_handler, so keep this line short).
                 self.logger.warning(f"⏱️ {zoneIP} did not answer {soapAction} "
                                     f"({type(exception_error).__name__}) — player offline or busy")
+                # Count connection-level failures (no route / refused) toward
+                # runtime offline detection. Read timeouts are just a busy
+                # player and don't count.
+                if isinstance(exception_error, requests.exceptions.ConnectionError):
+                    self._note_conn_failure(zoneIP)
                 raise
             except Exception as exception_error:
                 self.logger.error(f"SOAPSend Error: {exception_error}")
                 raise
 
+            self._note_conn_success(zoneIP)
             res_bytes = response.text.encode("utf-8")
             res = res_bytes.decode("utf-8")
             status = response.status_code
