@@ -404,6 +404,13 @@ class Plugin(indigo.PluginBase):
                         self.Sonos.check_event_subscriptions()
                     except Exception as exception_error:
                         self.exception_handler(exception_error, True)
+                    # Runtime offline detection: devices that went unreachable
+                    # while running (player died or moved IP mid-run) join the
+                    # deferred path above for reconnect / UID-based re-find.
+                    try:
+                        self.Sonos.check_unreachable_devices()
+                    except Exception as exception_error:
+                        self.exception_handler(exception_error, True)
                 self.sleep(60.0)
         except self.StopThread:
             pass
