@@ -7456,8 +7456,16 @@ class SonosPlugin(object):
         Keep it to a log line; check_event_subscriptions() does the repair.
         """
         try:
-            self.logger.warning(f"🩺 A Sonos event subscription failed to renew ({exception}) — "
-                                f"will re-subscribe on the next health check")
+            # Rate-limit: an already-expired subscription's renew thread fires
+            # this on EVERY cycle until torn down — one Event Log warning per
+            # minute is plenty; the rest go to the debug file log.
+            now = time.time()
+            if now - getattr(self, "_last_renew_fail_log", 0.0) >= 60.0:
+                self._last_renew_fail_log = now
+                self.logger.warning(f"🩺 A Sonos event subscription failed to renew ({exception}) — "
+                                    f"will re-subscribe on the next health check")
+            else:
+                self.logger.debug(f"🩺 subscription renew failure (rate-limited): {exception}")
         except Exception:
             pass
 
@@ -7494,6 +7502,13 @@ class SonosPlugin(object):
                 continue
             self.logger.warning(f"🩺 {dev.name}: event subscription(s) expired ({', '.join(dead)}) — re-subscribing")
             for name, sub in list(subs.items()):
+                # Cancel the renew thread FIRST — unsubscribe() raises on an
+                # already-expired sub before it gets to cancel the timer,
+                # leaving an orphan thread firing auto_renew_fail forever.
+                try:
+                    sub._auto_renew_cancel()  # SoCo internal, best-effort
+                except Exception:
+                    pass
                 try:
                     sub.unsubscribe()
                 except Exception:
@@ -7521,6 +7536,22 @@ class SonosPlugin(object):
         model_name = self.get_model_name(soco_device)
         self.logger.info(f"🧪 Model name for {indigo_device.name}: {model_name}")
 
+        # Tear down any EXISTING subscriptions for this device first — simply
+        # overwriting the dict orphans the old Subscription objects, whose
+        # auto-renew threads run forever and, once expired, fire
+        # auto_renew_fail ("Cannot renew subscription after expiry") on every
+        # cycle for eternity.
+        for _name, _old in list((self.soco_subs.get(indigo_device.id) or {}).items()):
+            try:
+                _old._auto_renew_cancel()  # SoCo internal, best-effort
+            except Exception:
+                pass
+            try:
+                if getattr(_old, "time_left", 0) > 0:
+                    _old.unsubscribe()
+            except Exception:
+                pass
+
         self.soco_subs[indigo_device.id] = {}
         self.soco_by_ip[indigo_device.address] = soco_device
         self.safe_debug(f"✅ soco_by_ip[{indigo_device.address}] stored with SoCo {soco_device.uid}")
@@ -7546,6 +7577,17 @@ class SonosPlugin(object):
                 # x-rincon link-stream filter in the event handler.
                 bonded_keywords = ["sub", "surround", "boost"]
                 is_bonded = any(kw in model_name.lower() for kw in bonded_keywords)
+                # Model names alone miss surrounds that are ordinary models —
+                # e.g. two Play:1s bonded to a Beam as rears (field report:
+                # they refuse AVTransport/RenderingControl subscriptions with
+                # None SID). Bonded satellites are INVISIBLE zones in the
+                # topology, so check visibility too (answered from soco's
+                # cached zone group state).
+                if not is_bonded:
+                    try:
+                        is_bonded = not soco_device.is_visible
+                    except Exception:
+                        pass
                 if is_bonded:
                     self.logger.debug(f"ℹ️ Skipping {service_name} subscription for {indigo_device.name} (bonded satellite)")
                     return

@@ -2,7 +2,7 @@
 
 Control your entire Sonos system from [Indigo](https://www.indigodomo.com) — playback, volume, grouping, favourites, streaming services, announcements, soundbar tuning, and native Sonos alarms — as first-class Indigo devices, actions, and triggers.
 
-**Current version: 2025.2.9** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
+**Current version: 2025.2.10** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
 
 ---
 
@@ -23,6 +23,7 @@ The plugin only subscribed to transport events for players that were *group coor
 
 ### Recent releases at a glance
 
+- **2025.2.10** — subscription re-subscribes no longer leave orphaned renew threads (warning-flood fix); bonded satellites identified by topology visibility, ending "None SID" errors for ordinary speakers used as surrounds.
 - **2025.2.8** — grouped players no longer show a phantom "playing" state from their link stream to the coordinator.
 - **2025.2.7** — event-subscription watchdog (states no longer freeze after a failed renewal — the old "works for days, then stops until restart") and a ~10x cut in per-event processing overhead.
 - **2025.2.6** — Amazon Polly announcements fully repaired (four stacked bugs, some dating to 2024.0.8) and expanded to Amazon's complete voice range, including neural and generative voices, selectable per engine tier in the Voice menu.
@@ -162,6 +163,8 @@ Grouped players mirror the coordinator's enriched metadata states, so a control 
 - **Menu → dump options** — group topology, subscribed devices, and SiriusXM channel dumps are available as diagnostic aids under the plugin menu.
 
 ## Version history
+
+**2025.2.10** — Fixes a flood of "subscription failed to renew" warnings: re-subscribing a player (offline recovery, subscription watchdog) left the old subscription objects' auto-renew threads running as orphans — once expired they can never renew, so each fired a warning every cycle forever. Old subscriptions are now properly torn down before re-subscribing (renew thread cancelled first — unsubscribing an already-expired subscription raises before reaching its own timer cancel), and the renew-failure warning is rate-limited to one per minute in the Event Log. Also: bonded satellites are now identified by topology visibility instead of model name — ordinary speakers bonded as rear surrounds (e.g. two Play:1s behind a Beam) no longer produce "subscription returned None SID" errors at startup.
 
 **2025.2.9** — Runtime offline detection and self-healing: a player that becomes unreachable *while the plugin is running* — powered off, dropped off WiFi, or moved to a new DHCP address (e.g. after a router restart re-deals every lease) — is now detected within ~3 minutes even on an idle system (an active liveness probe sweeps all players every minute; failed commands accelerate detection), marked `offline` with its state set to STOPPED, and handed to the background recovery loop, which reconnects when it returns or re-finds it by its Sonos ID at its new address automatically. An offline grouped player no longer inherits its coordinator's "playing" state, topology refreshes skip unreachable players instead of stalling and flooding the log, and soco-internal fetch failures log one concise warning. **Event subscriptions are now established for every player** (not only group coordinators at startup) — previously a player that was a group slave when the plugin started never received transport events, so if it later became a group's coordinator, that group's playback state froze at STOPPED. DHCP reservations for your players remain best practice.
 
