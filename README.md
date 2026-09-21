@@ -2,7 +2,7 @@
 
 Control your entire Sonos system from [Indigo](https://www.indigodomo.com) — playback, volume, grouping, favourites, streaming services, announcements, soundbar tuning, and native Sonos alarms — as first-class Indigo devices, actions, and triggers.
 
-**Current version: 2025.2.10** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
+**Current version: 2025.2.11** · Requires Indigo 2025.2+ (API 3.4) · Bundled SoCo 0.30.9 · Python 3
 
 ---
 
@@ -23,6 +23,7 @@ The plugin only subscribed to transport events for players that were *group coor
 
 ### Recent releases at a glance
 
+- **2025.2.11** — **fixes a 2025.2.10 regression that could silently stop all state updates** (event listener drifting off port 1400 behind a firewall); adds an event-flow watchdog that detects sustained event silence and recovers automatically. Please update from 2025.2.10.
 - **2025.2.10** — subscription re-subscribes no longer leave orphaned renew threads (warning-flood fix); bonded satellites identified by topology visibility, ending "None SID" errors for ordinary speakers used as surrounds.
 - **2025.2.8** — grouped players no longer show a phantom "playing" state from their link stream to the coordinator.
 - **2025.2.7** — event-subscription watchdog (states no longer freeze after a failed renewal — the old "works for days, then stops until restart") and a ~10x cut in per-event processing overhead.
@@ -163,6 +164,8 @@ Grouped players mirror the coordinator's enriched metadata states, so a control 
 - **Menu → dump options** — group topology, subscribed devices, and SiriusXM channel dumps are available as diagnostic aids under the plugin menu.
 
 ## Version history
+
+**2025.2.11** — **Important fix for a regression introduced in 2025.2.10 — please update.** The 2025.2.10 subscription-cleanup change could momentarily drop the number of active event subscriptions to zero during startup, which makes the SoCo library stop its event listener; the immediate restart could then land on port **1401** instead of 1400. On networks that firewall the Sonos VLAN to tcp/1400 only, every event notification was silently dropped from that moment — device states appeared blank or frozen with no errors logged, and a restart could reproduce rather than fix it. Apologies to anyone bitten. Now: new subscriptions are always established *before* old ones are removed (the listener and its port can never move), a loud error is logged if the listener is ever found off its configured port, and a new **event-flow watchdog** monitors actual event arrivals — sustained silence (which lease-health checks cannot detect) triggers automatic re-subscription and, if needed, a full event-listener restart, with clear log messages throughout.
 
 **2025.2.10** — Fixes a flood of "subscription failed to renew" warnings: re-subscribing a player (offline recovery, subscription watchdog) left the old subscription objects' auto-renew threads running as orphans — once expired they can never renew, so each fired a warning every cycle forever. Old subscriptions are now properly torn down before re-subscribing (renew thread cancelled first — unsubscribing an already-expired subscription raises before reaching its own timer cancel), and the renew-failure warning is rate-limited to one per minute in the Event Log. Also: bonded satellites are now identified by topology visibility instead of model name — ordinary speakers bonded as rear surrounds (e.g. two Play:1s behind a Beam) no longer produce "subscription returned None SID" errors at startup.
 

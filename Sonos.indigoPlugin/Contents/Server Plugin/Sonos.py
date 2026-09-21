@@ -7536,21 +7536,15 @@ class SonosPlugin(object):
         model_name = self.get_model_name(soco_device)
         self.logger.info(f"🧪 Model name for {indigo_device.name}: {model_name}")
 
-        # Tear down any EXISTING subscriptions for this device first — simply
-        # overwriting the dict orphans the old Subscription objects, whose
-        # auto-renew threads run forever and, once expired, fire
-        # auto_renew_fail ("Cannot renew subscription after expiry") on every
-        # cycle for eternity.
-        for _name, _old in list((self.soco_subs.get(indigo_device.id) or {}).items()):
-            try:
-                _old._auto_renew_cancel()  # SoCo internal, best-effort
-            except Exception:
-                pass
-            try:
-                if getattr(_old, "time_left", 0) > 0:
-                    _old.unsubscribe()
-            except Exception:
-                pass
+        # Hold the device's EXISTING subscriptions for teardown AT THE END —
+        # order matters critically: unsubscribing first can drop soco's global
+        # subscription count to ZERO, which STOPS the event listener; the
+        # subsequent re-subscribe restarts it and can land on the NEXT port
+        # (1401) if 1400 is still closing — silently killing ALL events for
+        # users whose firewall only passes tcp/1400 (field case: blank states
+        # after every restart). Subscribing the new subs first keeps the
+        # count above zero so the listener — and its port — never move.
+        _old_subs_to_teardown = dict(self.soco_subs.get(indigo_device.id) or {})
 
         self.soco_subs[indigo_device.id] = {}
         self.soco_by_ip[indigo_device.address] = soco_device
@@ -7653,6 +7647,35 @@ class SonosPlugin(object):
                 _sub.auto_renew_fail = self._on_subscription_renew_fail
             except Exception:
                 pass
+
+        # NOW tear down the old subscriptions (new ones are registered, so the
+        # listener's subscription count stays above zero — see note at top).
+        # Cancel the renew thread first: unsubscribe() raises on an expired
+        # sub before reaching its own timer cancel, orphaning the thread.
+        for _name, _old in _old_subs_to_teardown.items():
+            try:
+                _old._auto_renew_cancel()  # SoCo internal, best-effort
+            except Exception:
+                pass
+            try:
+                if getattr(_old, "time_left", 0) > 0:
+                    _old.unsubscribe()
+            except Exception:
+                pass
+
+        # Port guard: a listener not on the configured port (1400) is
+        # invisible death for firewalled/VLAN setups — players NOTIFY a port
+        # the router blocks. Shout, don't whisper.
+        try:
+            _bound = getattr(event_listener, "address", None)
+            _want = int(getattr(soco.config, "EVENT_LISTENER_PORT", 1400) or 1400)
+            if _bound and int(_bound[1]) != _want:
+                self.logger.error(
+                    f"🧱 SoCo event listener is bound to port {_bound[1]} instead of {_want}! "
+                    f"Firewalled/VLAN setups only pass tcp/{_want} — events will not arrive. "
+                    f"Restart the plugin to rebind; if this recurs, please report it.")
+        except Exception:
+            pass
 
         # Final Listener Check
         self.logger.debug(
@@ -7784,6 +7807,82 @@ class SonosPlugin(object):
         """Any successful command clears the failure record for that IP."""
         if getattr(self, "_conn_failures", None):
             self._conn_failures.pop(ip, None)
+
+    def _resubscribe_all_players(self):
+        """Fresh event subscriptions for every enabled, reachable player.
+
+        socoSubscribe tears down each device's old subscriptions first, so
+        this is safe to call wholesale.
+        """
+        for dev in indigo.devices.iter("com.ssi.indigoplugin.Sonos"):
+            if not dev.enabled or dev.id in (getattr(self, "deferred_start_devices", None) or set()):
+                continue
+            ip = (dev.pluginProps.get("address") or dev.address or "").strip()
+            if not ip or not self.is_host_reachable(ip, timeout=1.0):
+                continue
+            try:
+                soco_device = self.soco_by_ip.get(ip) or SoCo(ip)
+                self.soco_by_ip[ip] = soco_device
+                self.socoSubscribe(dev, soco_device)
+            except Exception as e:
+                self.logger.error(f"❌ Re-subscribe failed for {dev.name}: {e}")
+
+    def check_event_flow(self):
+        """Detect TOTAL event silence and recover — the failure the lease
+        watchdog cannot see.
+
+        Subscription leases stay healthy while the inbound NOTIFY path is
+        dead (renewal is outbound; the listener socket/thread can die
+        silently, or the network path from the players can break). Field
+        case: ~20h of zero events with every subscription showing a valid
+        SID. On a multi-player system, ZGT/transport NOTIFYs arrive at
+        least every few minutes — prolonged silence means the pipe is dead.
+
+        Staged recovery, called every 60s from runConcurrentThread:
+          stage 1 (>15 min silent): fresh subscriptions for all players
+            (new SIDs make the players start NOTIFYing the listener again).
+          stage 2 (>30 min silent): stop the SoCo event listener entirely —
+            the next subscribe restarts it with a fresh server socket —
+            then re-subscribe all players.
+        The heartbeat in soco_event_handler resets the staging.
+        """
+        now = time.time()
+        last = getattr(self, "_last_event_ts", None)
+        if last is None:
+            self._last_event_ts = now  # baseline from startup
+            return
+        silence = now - last
+        if silence < 900.0:
+            return
+        stage = getattr(self, "_event_flow_stage", 0)
+        if stage == 0:
+            self.logger.warning(
+                f"🩺 No Sonos events received for {int(silence / 60)} minutes "
+                f"(listener running={getattr(event_listener, 'is_running', '?')}) — "
+                f"re-subscribing all players")
+            self._event_flow_stage = 1
+            self._resubscribe_all_players()
+        elif stage == 1 and silence >= 1800.0:
+            self.logger.warning(
+                "🩺 Still no events after re-subscribing — restarting the SoCo "
+                "event listener and re-subscribing")
+            self._event_flow_stage = 2
+            try:
+                event_listener.stop()
+            except Exception as e:
+                self.logger.debug(f"event listener stop failed (continuing): {e}")
+            # Let the old server socket fully close before the first subscribe
+            # restarts the listener — an immediate rebind can hit EADDRINUSE
+            # and walk to port 1401, which firewalled setups block.
+            time.sleep(3.0)
+            self._resubscribe_all_players()
+        elif stage == 2 and silence >= 3600.0:
+            # Escalate once an hour at most; keep trying the full restart.
+            self.logger.error(
+                f"❌ Sonos events still silent after listener restart "
+                f"({int(silence / 60)} min) — will keep retrying; check network "
+                f"path from players to this Mac (tcp/1400) if this persists")
+            self._event_flow_stage = 1  # loop back through the stages
 
     def check_unreachable_devices(self):
         """Runtime offline detection: extend the startup self-heal to devices
@@ -8689,6 +8788,12 @@ class SonosPlugin(object):
                 zone_ip = "unknown"
 
             state_updates = {}
+
+            # Event-flow heartbeat: check_event_flow() watches this — lease
+            # renewals are outbound and can stay healthy while the inbound
+            # NOTIFY path is dead, so actual arrivals are the only real signal.
+            self._last_event_ts = time.time()
+            self._event_flow_stage = 0
 
             self.safe_debug(f"🧪 Event handler fired! SID={getattr(event_obj, 'sid', 'N/A')} zone_ip={zone_ip} Type={type(event_obj)}")
             self.safe_debug(f"🧑‍💻 Full event variables: {getattr(event_obj, 'variables', {})}")

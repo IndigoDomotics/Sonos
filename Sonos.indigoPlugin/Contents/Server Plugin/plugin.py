@@ -411,6 +411,14 @@ class Plugin(indigo.PluginBase):
                         self.Sonos.check_unreachable_devices()
                     except Exception as exception_error:
                         self.exception_handler(exception_error, True)
+                    # Event-flow watchdog: subscriptions can look healthy
+                    # (renewal is outbound) while the inbound NOTIFY path is
+                    # dead — recover by re-subscribing, then restarting the
+                    # SoCo event listener.
+                    try:
+                        self.Sonos.check_event_flow()
+                    except Exception as exception_error:
+                        self.exception_handler(exception_error, True)
                 self.sleep(60.0)
         except self.StopThread:
             pass
