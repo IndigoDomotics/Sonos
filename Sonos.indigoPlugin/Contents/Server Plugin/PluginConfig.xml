@@ -65,6 +65,12 @@
 	<Field id="SoundFilePath" type="textfield">
 		<Label>Sound File Path:</Label>
 	</Field>
+	<Field id="minimalLoggingNote" type="label" fontColor="darkgray" fontSize="small" alignWithControl="false">
+		<Label>Minimal logging keeps the Event Log to essentials: one line per player at startup and warnings/errors only. Untick for verbose startup detail including the full group-state dump (also available any time from the plugin menu).</Label>
+	</Field>
+	<Field type="checkbox" id="minimalLogging" defaultValue="true" tooltip="Keep the Event Log concise (recommended)">
+		<Label>Minimal logging:</Label>
+	</Field>
 	<Field id="useSocoSnapshotNote" type="label" fontColor="darkgray" fontSize="small" alignWithControl="false">
 		<Label>Save and restore player state around announcements using SoCo Snapshot/Restore (recommended, same mechanism Home Assistant uses). Untick to fall back to the legacy save/restore flow.</Label>
 	</Field>
