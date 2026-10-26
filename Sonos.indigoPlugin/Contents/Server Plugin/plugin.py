@@ -109,6 +109,14 @@ class Plugin(indigo.PluginBase):
         self.logger = logging.getLogger("Plugin.Sonos")
         self.logger.info("Plugin logging now started.")
 
+        # Show the plugin info box FIRST — before SonosPlugin construction
+        # produces any other output. Everything it needs (plugin globals,
+        # Indigo server info, soco version) is already available here.
+        try:
+            self.display_plugin_information()
+        except Exception as e:
+            self.logger.debug(f"display_plugin_information at init failed: {e}")
+
         self.debug = False
         self.xmlDebug = False
         self.eventsDebug = False
@@ -360,7 +368,6 @@ class Plugin(indigo.PluginBase):
 
 
             self.Sonos.startup()  # ✅ <-- This was previously commented out but now active
-            self.display_plugin_information()
 
             #self.logger.warning("🔎 Dumping state keys for all Sonos devices:")
             #for dev in indigo.devices.iter("com.ssi.indigoplugin.Sonos"):
