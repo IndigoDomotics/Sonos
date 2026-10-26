@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 #
 import indigo
-indigo.server.log("🧪 [pandora.py] This module was loaded")
+# module load logging removed — was Event Log noise on every plugin start
 import urllib.request
 from connection import PandoraConnection
 

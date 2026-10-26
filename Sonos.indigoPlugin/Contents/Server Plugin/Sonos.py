@@ -51,7 +51,7 @@ from soco.core import SoCo
 from soco import SoCo as SoCoDevice
 from soco.events import event_listener
 soco.config.EVENTS_MODULE = soco.events
-logging.getLogger("Plugin.Sonos").info(
+logging.getLogger("Plugin.Sonos").debug(
     f"🧪 The SoCo version used in this plugin was loaded from: {soco.__file__}"
 )
 
@@ -316,7 +316,11 @@ class SonosPlugin(object):
         self.plugin = plugin
         self.pluginPrefs = pluginPrefs
         self.logger = logging.getLogger("Plugin.Sonos")
-        self.logger.info(f"Initializing SonosPlugin... [{uuid.uuid4()}]")
+        self.logger.debug(f"Initializing SonosPlugin... [{uuid.uuid4()}]")
+
+        # Minimal logging (default ON, incl. installs without the pref).
+        # vinfo() routes through this: INFO when unticked, debug when on.
+        self.minimalLogging = str(pluginPrefs.get("minimalLogging", True)).lower() in ("true", "1", "yes", "on")
 
         # ✅ DO NOT alias Indigo devices (read-only) into self.devices.
         #    Keep self.devices as a writable plugin-local cache, and (optionally)
@@ -2390,7 +2394,7 @@ class SonosPlugin(object):
 
 
     def load_siriusxm_channel_data(self):
-        self.logger.info("🧪 ENTERED load_siriusxm_channel_data()")
+        self.logger.debug("🧪 ENTERED load_siriusxm_channel_data()")
 
         import os
         import json
@@ -2416,13 +2420,13 @@ class SonosPlugin(object):
         XMChannel.from_dict = staticmethod(patched_from_dict)
 
         cache_path = os.path.join(indigo.server.getInstallFolderPath(), "Preferences", "Plugins", "siriusxm_channel_cache.json")
-        self.logger.info("📂 Checking for SiriusXM channel cache...")
+        self.logger.debug("📂 Checking for SiriusXM channel cache...")
 
         sxm_username = self.pluginPrefs.get("SiriusXMID", "").strip()
         sxm_password = self.pluginPrefs.get("SiriusXMPassword", "").strip()
 
         if not sxm_username or not sxm_password:
-            self.logger.warning("⚠️ SiriusXM credentials not provided in plugin preferences")
+            self.logger.debug("⚠️ SiriusXM credentials not provided in plugin preferences")
             return
 
         # Always initialize the client
@@ -3403,14 +3407,14 @@ class SonosPlugin(object):
             if not self.announce_bind_ip:
                 self.logger.warning("⚠️ No safe LAN IP available to publish for announcements (loopback/0.0.0.0).")
             else:
-                self.logger.info(f"✅ Announcement HTTP publish host: {self.announce_bind_ip}:{self._announce_http_port}")
+                self.vinfo(f"✅ Announcement HTTP publish host: {self.announce_bind_ip}:{self._announce_http_port}")
 
                 # Quick self-test (HEAD /) so we know Sonos can reach it by IP:PORT
                 try:
                     conn = http.client.HTTPConnection(self.announce_bind_ip, self._announce_http_port, timeout=2.5)
                     conn.request("HEAD", "/")
                     resp = conn.getresponse()
-                    self.logger.info(f"🧪 Announcement server self-test: {resp.status} {resp.reason}")
+                    self.vinfo(f"🧪 Announcement server self-test: {resp.status} {resp.reason}")
                     conn.close()
                 except Exception as e:
                     self.logger.warning(
@@ -4658,7 +4662,7 @@ class SonosPlugin(object):
                 self.logger.error(f"❌ Error re-evaluating group state for {dev.name}: {e}")
 
         # Optional debug dump
-        if hasattr(self, "dump_groups_to_log"):
+        if hasattr(self, "dump_groups_to_log") and not getattr(self, "minimalLogging", True):
             self.dump_groups_to_log()
 
 
@@ -6442,6 +6446,8 @@ class SonosPlugin(object):
                 except Exception as exception_error:
                     self.plugin.debug = False
 
+                self.minimalLogging = str(self.plugin.pluginPrefs.get("minimalLogging", True)).lower() in ("true", "1", "yes", "on")
+
                 try:
                     self.plugin.xmlDebug = self.plugin.pluginPrefs["showXMLInLog"]
                 except Exception as exception_error:
@@ -6657,7 +6663,7 @@ class SonosPlugin(object):
                 e_resMD = Favorite.findtext('.//{urn:schemas-rinconnetworks-com:metadata-1-0/}resMD')
                 Sonos_Favorites.append((e_res, e_title, e_resMD, e_res_clean, e_id))
                 self.safe_debug(f"\tSonos Favorites: {e_id}, {e_title}, {e_res}")
-            self.logger.info(f"Loaded Sonos Favorites... [{len(Sonos_Favorites)}]")
+            self.vinfo(f"Loaded Sonos Favorites... [{len(Sonos_Favorites)}]")
 
         except Exception as exception_error:
             self.exception_handler(exception_error, True)  # Log error and display failing statement
@@ -6961,7 +6967,7 @@ class SonosPlugin(object):
 
 
     def startup(self):
-        self.logger.info("🔌 Sonos Plugin Starting Up...")
+        self.vinfo("🔌 Sonos Plugin Starting Up...")
 
 
         # at plugin start
@@ -6974,6 +6980,11 @@ class SonosPlugin(object):
         # Ensure that the artwork folder exists for saving images
         ARTWORK_FOLDER = "/Library/Application Support/Perceptive Automation/images/Sonos/"
         os.makedirs(ARTWORK_FOLDER, exist_ok=True)
+
+        # Minimal logging (default ON): one line per device at startup, no
+        # group-state dump, service-load detail at debug. Deep diagnostics
+        # remain available via the debug-logging checkbox and plugin.log.
+        self.minimalLogging = str(self.pluginPrefs.get("minimalLogging", True)).lower() in ("true", "1", "yes", "on")
 
         # check for sound file?
         self.SoundFilePath = self.pluginPrefs.get("SoundFilePath", "")
@@ -7023,7 +7034,7 @@ class SonosPlugin(object):
 
         # start the announce http server - DT
         ip, port, root = self.get_announce_http_config()
-        self.logger.info(f"📢 Announcement HTTP config → ip='{ip or 'ALL'}', port={port}, root='{root}'")
+        self.vinfo(f"📢 Announcement HTTP config → ip='{ip or 'ALL'}', port={port}, root='{root}'")
 
         # Ensure SoundFilePath points at the folder we intend to serve (keep your earlier choice if set)
         if not self.SoundFilePath:
@@ -7078,7 +7089,7 @@ class SonosPlugin(object):
             self.HTTPServer = publish_host
 
             if _usable_host(self.HTTPServer):
-                self.logger.info(f"🌐 Using {self.HTTPServer} as HTTPServer for announcements")
+                self.vinfo(f"🌐 Using {self.HTTPServer} as HTTPServer for announcements")
             else:
                 self.logger.warning("⚠️ No safe LAN IP available yet for announcements; will re-evaluate after server start.")
         except Exception as e:
@@ -7130,7 +7141,7 @@ class SonosPlugin(object):
         try:
             global NSVoices
             NSVoices = NSSpeechSynthesizer.availableVoices()
-            self.logger.info(f"🗣️ Loaded Apple Voices.. [{len(NSVoices)}]")
+            self.vinfo(f"🗣️ Loaded Apple Voices.. [{len(NSVoices)}]")
         except Exception as e:
             self.logger.error(f"❌ Cannot load Apple Voices: {e}")
 
@@ -7182,7 +7193,7 @@ class SonosPlugin(object):
                 for device in discovered:
                     self.soco_by_ip[device.ip_address] = device
             else:
-                self.logger.warning("⚠️ SoCo discovery found no Sonos devices on the network (continuing)")
+                self.logger.debug("⚠️ SoCo discovery found no Sonos devices on the network (continuing)")
         except Exception as e:
             self.logger.error(f"❌ SoCo discovery failed (continuing): {e}")
 
@@ -7534,7 +7545,7 @@ class SonosPlugin(object):
 
         # ✅ Use helper to get model name
         model_name = self.get_model_name(soco_device)
-        self.logger.info(f"🧪 Model name for {indigo_device.name}: {model_name}")
+        self.logger.debug(f"🧪 Model name for {indigo_device.name}: {model_name}")
 
         # Hold the device's EXISTING subscriptions for teardown AT THE END —
         # order matters critically: unsubscribing first can drop soco's global
@@ -7767,6 +7778,18 @@ class SonosPlugin(object):
             self.logger.debug(f"safe_uid: could not fetch UID from {ip}: {e}")
             return None
 
+    def vinfo(self, msg):
+        """Verbose-info: INFO when 'Minimal logging' is unticked, debug when on.
+
+        Used for the informative-but-chatty startup lines so the checkbox
+        genuinely controls startup verbosity (the group-state dump is gated
+        separately; true noise stays debug-only regardless).
+        """
+        if getattr(self, "minimalLogging", True):
+            self.logger.debug(msg)
+        else:
+            self.logger.info(msg)
+
     def _log_net_or_error(self, context, exception_error):
         """Log helper for paths that talk to players via soco/requests directly.
 
@@ -7856,10 +7879,11 @@ class SonosPlugin(object):
             return
         stage = getattr(self, "_event_flow_stage", 0)
         if stage == 0:
-            self.logger.warning(
+            self.logger.debug(
                 f"🩺 No Sonos events received for {int(silence / 60)} minutes "
                 f"(listener running={getattr(event_listener, 'is_running', '?')}) — "
-                f"re-subscribing all players")
+                f"quietly re-subscribing all players (idle systems legitimately go quiet; "
+                f"the re-subscribe doubles as a liveness probe)")
             self._event_flow_stage = 1
             self._resubscribe_all_players()
         elif stage == 1 and silence >= 1800.0:
@@ -8294,6 +8318,7 @@ class SonosPlugin(object):
 
             #self.initZones(indigo_device)
             self.initZones(indigo_device, soco_device)
+            self.logger.info(f"✅ {indigo_device.name} ({indigo_device.address}) ready — {model_name}")
             self.logger.debug(f"During start up - lets evaluate_and_update current grouped states - yes ????")
             self.refresh_group_topology_after_plugin_zone_change()
             #self.evaluate_and_update_grouped_states()
@@ -8488,7 +8513,7 @@ class SonosPlugin(object):
                 self.logger.error(f"❌ Invalid subnet format '{subnet_to_use}': {e}")
                 return None
 
-            self.logger.info(f"🔍 Searching for interface IP on subnet {target_net}...")
+            self.logger.debug(f"🔍 Searching for interface IP on subnet {target_net}...")
 
             found_ip = None
             adapters = ifaddr.get_adapters()
@@ -8540,7 +8565,7 @@ class SonosPlugin(object):
                     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                         s.connect((probe_ip, 1400))  # no packet sent — just resolves routing
                         found_ip = s.getsockname()[0]
-                    self.logger.info(
+                    self.logger.debug(
                         f"   ✅ No interface directly on {target_net}; Sonos subnet appears routed — "
                         f"using source IP {found_ip} (via route to {probe_ip})")
                     return found_ip
@@ -9691,7 +9716,10 @@ class SonosPlugin(object):
 
         def _run_once():
             try:
-                self.dump_groups_to_log()
+                if getattr(self, "minimalLogging", True):
+                    self.logger.debug("⏩ Startup group-state dump suppressed (minimal logging; available from the plugin menu)")
+                else:
+                    self.dump_groups_to_log()
             except Exception as e:
                 self._log_net_or_error("dump_groups_to_log", e)
             finally:
@@ -11792,7 +11820,7 @@ class SonosPlugin(object):
 
         master_art_path = f"{ARTWORK_FOLDER}sonos_art_{coord_ip}.jpg"
         if not os.path.exists(master_art_path):
-            self.logger.warning(f"⚠️ No master artwork file for {coordinator_dev.name} ({coord_ip}), falling back to default")
+            self.logger.debug(f"⚠️ No master artwork file for {coordinator_dev.name} ({coord_ip}), falling back to default")
             master_art_path = DEFAULT_ART_PATH
 
         # Identify all Indigo devices that share the same group name and are grouped
@@ -11860,7 +11888,7 @@ class SonosPlugin(object):
 
         master_art_path = f"{ARTWORK_FOLDER}sonos_art_{coord_ip}.jpg"
         if not os.path.exists(master_art_path):
-            self.logger.warning(f"⚠️ No master artwork file for {coordinator_dev.name} ({coord_ip}), falling back to default")
+            self.logger.debug(f"⚠️ No master artwork file for {coordinator_dev.name} ({coord_ip}), falling back to default")
             master_art_path = DEFAULT_ART_PATH
 
         # Identify all Indigo devices that share the same group name and are grouped
@@ -12179,7 +12207,7 @@ class SonosPlugin(object):
         self.updateZoneGroupStates (dev)
         self.updateZoneTopology (dev)
 
-        indigo.server.log ("Adding ZonePlayer: %s, %s, %s" % (zoneIP, LocalUID, dev.name))
+        self.logger.debug("Adding ZonePlayer: %s, %s, %s" % (zoneIP, LocalUID, dev.name))
         self.ZonePlayers.append (LocalUID)
         if hasattr(dev, "pluginProps"):
             self.ZPTypes.append([LocalUID, dict(dev.pluginProps).get("model", "")])
@@ -12470,7 +12498,7 @@ class SonosPlugin(object):
 
     def getPlaylistsDirect(self):
         try:
-            self.logger.info("📡 Loading Sonos Playlists...")
+            self.vinfo("📡 Loading Sonos Playlists...")
 
             soco_device = self.get_soco_device(self.rootZPIP)
             if not soco_device:
@@ -12512,7 +12540,7 @@ class SonosPlugin(object):
             for entry in Sonos_Playlists:
                 self.safe_debug(f"🧾 {entry}")
 
-            self.logger.info(f"✅ Loaded {len(Sonos_Playlists)} Sonos playlists.")
+            self.vinfo(f"✅ Loaded {len(Sonos_Playlists)} Sonos playlists.")
 
         except Exception as e:
             self.logger.error(f"❌ getPlaylistsDirect: {e}")
@@ -12547,7 +12575,7 @@ class SonosPlugin(object):
                     Sonos_RT_FavStations.append((e_res, e_title))
                     self.safe_debug(f"\tRadioTime Favorite Station: {e_id}, {e_title}, {e_res}")
                     list_count = list_count + 1
-            self.logger.info(f"Loaded RadioTime Favorite Stations... [{list_count}]")
+            self.vinfo(f"Loaded RadioTime Favorite Stations... [{list_count}]")
 
         except Exception as exception_error:
             self.exception_handler(exception_error, True)  # Log error and display failing statement
@@ -12624,14 +12652,14 @@ class SonosPlugin(object):
                         try:
                             os.remove(filepath)
                             deleted += 1
-                            self.logger.info(f"🗑️ Deleted stale artwork file: {filename}")
+                            self.logger.debug(f"🗑️ Deleted stale artwork file: {filename}")
                         except Exception as e:
                             self.logger.warning(f"⚠️ Could not delete {filename}: {e}")
 
         if deleted > 0:
-            self.logger.info(f"🧹 Artwork cleanup done: {deleted} file(s) removed.")
+            self.vinfo(f"🧹 Artwork cleanup done: {deleted} file(s) removed.")
         else:
-            self.logger.info("🧹 No stale artwork files found.")
+            self.vinfo("🧹 No stale artwork files found.")
 
 
 
@@ -12686,10 +12714,10 @@ class SonosPlugin(object):
                 self.logger.debug(f"🧪 Found file in folder: {f}")
                 if f.lower().endswith(".mp3"):
                     self.Sound_Files.append(f)
-                    self.logger.info(f"🎵 Added sound file: {f}")
+                    self.logger.debug(f"🎵 Added sound file: {f}")
                     list_count += 1
 
-            self.logger.info(f"✅ Loaded Sound Files... [{list_count}]")
+            self.vinfo(f"✅ Loaded Sound Files... [{list_count}]")
         except Exception as exception_error:
             self.exception_handler(exception_error, True)
 
@@ -12964,7 +12992,7 @@ class SonosPlugin(object):
                     PollyVoices.append([voice["Id"], voice["Name"], voice["Gender"],
                                         voice["LanguageCode"], voice["LanguageName"],
                                         list(voice.get("SupportedEngines") or [])])
-                self.logger.info(f"Loaded Polly Voices... [{len(PollyVoices)}]")
+                self.vinfo(f"Loaded Polly Voices... [{len(PollyVoices)}]")
         except Exception as exception_error:
             self.logger.error(f"❌ Could not load Polly voices: {exception_error}")
 

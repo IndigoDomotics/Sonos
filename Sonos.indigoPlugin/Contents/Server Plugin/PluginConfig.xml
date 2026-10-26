@@ -191,6 +191,12 @@
 	</Field>
 	<Field id="simpleSeparator9" type="separator"/>
 
+	<Field id="minimalLoggingNote" type="label" fontColor="darkgray" fontSize="small" alignWithControl="false">
+		<Label>Minimal logging keeps the Event Log to essentials: one line per player at startup and warnings/errors only. Untick for verbose startup detail including the full group-state dump (also available any time from the plugin menu).</Label>
+	</Field>
+	<Field type="checkbox" id="minimalLogging" defaultValue="true" tooltip="Keep the Event Log concise (recommended)">
+		<Label>Minimal logging:</Label>
+	</Field>
 	<Field id="showDebugInLogNote" type="label" fontColor="darkgray" fontSize="small" alignWithControl="false">
 		<Label>Check the boxes below for additional information to log to the Indigo Event Log.  Basic Debugging must be checked for any other deubgging to function.</Label>
 	</Field>

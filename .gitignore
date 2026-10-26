@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 announcement*.mp3
 Contents/Packages/
+Sonos.indigoPlugin/Contents/Packages/
