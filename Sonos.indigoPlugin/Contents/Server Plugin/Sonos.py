@@ -318,6 +318,10 @@ class SonosPlugin(object):
         self.logger = logging.getLogger("Plugin.Sonos")
         self.logger.debug(f"Initializing SonosPlugin... [{uuid.uuid4()}]")
 
+        # Minimal logging (default ON, incl. installs without the pref).
+        # vinfo() routes through this: INFO when unticked, debug when on.
+        self.minimalLogging = str(pluginPrefs.get("minimalLogging", True)).lower() in ("true", "1", "yes", "on")
+
         # ✅ DO NOT alias Indigo devices (read-only) into self.devices.
         #    Keep self.devices as a writable plugin-local cache, and (optionally)
         #    keep a separate read-only handle to Indigo’s DeviceList.
@@ -3403,14 +3407,14 @@ class SonosPlugin(object):
             if not self.announce_bind_ip:
                 self.logger.warning("⚠️ No safe LAN IP available to publish for announcements (loopback/0.0.0.0).")
             else:
-                self.logger.debug(f"✅ Announcement HTTP publish host: {self.announce_bind_ip}:{self._announce_http_port}")
+                self.vinfo(f"✅ Announcement HTTP publish host: {self.announce_bind_ip}:{self._announce_http_port}")
 
                 # Quick self-test (HEAD /) so we know Sonos can reach it by IP:PORT
                 try:
                     conn = http.client.HTTPConnection(self.announce_bind_ip, self._announce_http_port, timeout=2.5)
                     conn.request("HEAD", "/")
                     resp = conn.getresponse()
-                    self.logger.debug(f"🧪 Announcement server self-test: {resp.status} {resp.reason}")
+                    self.vinfo(f"🧪 Announcement server self-test: {resp.status} {resp.reason}")
                     conn.close()
                 except Exception as e:
                     self.logger.warning(
@@ -6659,7 +6663,7 @@ class SonosPlugin(object):
                 e_resMD = Favorite.findtext('.//{urn:schemas-rinconnetworks-com:metadata-1-0/}resMD')
                 Sonos_Favorites.append((e_res, e_title, e_resMD, e_res_clean, e_id))
                 self.safe_debug(f"\tSonos Favorites: {e_id}, {e_title}, {e_res}")
-            self.logger.debug(f"Loaded Sonos Favorites... [{len(Sonos_Favorites)}]")
+            self.vinfo(f"Loaded Sonos Favorites... [{len(Sonos_Favorites)}]")
 
         except Exception as exception_error:
             self.exception_handler(exception_error, True)  # Log error and display failing statement
@@ -6963,7 +6967,7 @@ class SonosPlugin(object):
 
 
     def startup(self):
-        self.logger.debug("🔌 Sonos Plugin Starting Up...")
+        self.vinfo("🔌 Sonos Plugin Starting Up...")
 
 
         # at plugin start
@@ -7030,7 +7034,7 @@ class SonosPlugin(object):
 
         # start the announce http server - DT
         ip, port, root = self.get_announce_http_config()
-        self.logger.debug(f"📢 Announcement HTTP config → ip='{ip or 'ALL'}', port={port}, root='{root}'")
+        self.vinfo(f"📢 Announcement HTTP config → ip='{ip or 'ALL'}', port={port}, root='{root}'")
 
         # Ensure SoundFilePath points at the folder we intend to serve (keep your earlier choice if set)
         if not self.SoundFilePath:
@@ -7085,7 +7089,7 @@ class SonosPlugin(object):
             self.HTTPServer = publish_host
 
             if _usable_host(self.HTTPServer):
-                self.logger.debug(f"🌐 Using {self.HTTPServer} as HTTPServer for announcements")
+                self.vinfo(f"🌐 Using {self.HTTPServer} as HTTPServer for announcements")
             else:
                 self.logger.warning("⚠️ No safe LAN IP available yet for announcements; will re-evaluate after server start.")
         except Exception as e:
@@ -7137,7 +7141,7 @@ class SonosPlugin(object):
         try:
             global NSVoices
             NSVoices = NSSpeechSynthesizer.availableVoices()
-            self.logger.debug(f"🗣️ Loaded Apple Voices.. [{len(NSVoices)}]")
+            self.vinfo(f"🗣️ Loaded Apple Voices.. [{len(NSVoices)}]")
         except Exception as e:
             self.logger.error(f"❌ Cannot load Apple Voices: {e}")
 
@@ -7773,6 +7777,18 @@ class SonosPlugin(object):
         except Exception as e:
             self.logger.debug(f"safe_uid: could not fetch UID from {ip}: {e}")
             return None
+
+    def vinfo(self, msg):
+        """Verbose-info: INFO when 'Minimal logging' is unticked, debug when on.
+
+        Used for the informative-but-chatty startup lines so the checkbox
+        genuinely controls startup verbosity (the group-state dump is gated
+        separately; true noise stays debug-only regardless).
+        """
+        if getattr(self, "minimalLogging", True):
+            self.logger.debug(msg)
+        else:
+            self.logger.info(msg)
 
     def _log_net_or_error(self, context, exception_error):
         """Log helper for paths that talk to players via soco/requests directly.
@@ -12482,7 +12498,7 @@ class SonosPlugin(object):
 
     def getPlaylistsDirect(self):
         try:
-            self.logger.debug("📡 Loading Sonos Playlists...")
+            self.vinfo("📡 Loading Sonos Playlists...")
 
             soco_device = self.get_soco_device(self.rootZPIP)
             if not soco_device:
@@ -12524,7 +12540,7 @@ class SonosPlugin(object):
             for entry in Sonos_Playlists:
                 self.safe_debug(f"🧾 {entry}")
 
-            self.logger.debug(f"✅ Loaded {len(Sonos_Playlists)} Sonos playlists.")
+            self.vinfo(f"✅ Loaded {len(Sonos_Playlists)} Sonos playlists.")
 
         except Exception as e:
             self.logger.error(f"❌ getPlaylistsDirect: {e}")
@@ -12559,7 +12575,7 @@ class SonosPlugin(object):
                     Sonos_RT_FavStations.append((e_res, e_title))
                     self.safe_debug(f"\tRadioTime Favorite Station: {e_id}, {e_title}, {e_res}")
                     list_count = list_count + 1
-            self.logger.debug(f"Loaded RadioTime Favorite Stations... [{list_count}]")
+            self.vinfo(f"Loaded RadioTime Favorite Stations... [{list_count}]")
 
         except Exception as exception_error:
             self.exception_handler(exception_error, True)  # Log error and display failing statement
@@ -12641,9 +12657,9 @@ class SonosPlugin(object):
                             self.logger.warning(f"⚠️ Could not delete {filename}: {e}")
 
         if deleted > 0:
-            self.logger.debug(f"🧹 Artwork cleanup done: {deleted} file(s) removed.")
+            self.vinfo(f"🧹 Artwork cleanup done: {deleted} file(s) removed.")
         else:
-            self.logger.debug("🧹 No stale artwork files found.")
+            self.vinfo("🧹 No stale artwork files found.")
 
 
 
@@ -12701,7 +12717,7 @@ class SonosPlugin(object):
                     self.logger.debug(f"🎵 Added sound file: {f}")
                     list_count += 1
 
-            self.logger.debug(f"✅ Loaded Sound Files... [{list_count}]")
+            self.vinfo(f"✅ Loaded Sound Files... [{list_count}]")
         except Exception as exception_error:
             self.exception_handler(exception_error, True)
 
@@ -12976,7 +12992,7 @@ class SonosPlugin(object):
                     PollyVoices.append([voice["Id"], voice["Name"], voice["Gender"],
                                         voice["LanguageCode"], voice["LanguageName"],
                                         list(voice.get("SupportedEngines") or [])])
-                self.logger.debug(f"Loaded Polly Voices... [{len(PollyVoices)}]")
+                self.vinfo(f"Loaded Polly Voices... [{len(PollyVoices)}]")
         except Exception as exception_error:
             self.logger.error(f"❌ Could not load Polly voices: {exception_error}")
 
