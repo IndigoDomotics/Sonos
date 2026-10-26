@@ -127,7 +127,7 @@ class Plugin(indigo.PluginBase):
             self.logger.error(f"❌ Failed to initialize SonosPlugin: {e}")
             self.Sonos = None
 
-        self.logger.info("Plugin __init__ ended.")
+        self.logger.debug("Plugin __init__ ended.")
 
     def __del__(self):
         indigo.PluginBase.__del__(self)
@@ -293,26 +293,24 @@ class Plugin(indigo.PluginBase):
             soco_path = getattr(soco, '__file__', 'unknown')
 
             def plugin_information_message():
-                lines = []
-                lines.append("Plugin Information:\n")
-                lines.append(f"{'Plugin Name:':<30} {self.globals[PLUGIN_INFO][PLUGIN_DISPLAY_NAME]}")
-                lines.append(f"{'Plugin Version:':<30} {self.globals[PLUGIN_INFO][PLUGIN_VERSION]}")
-                lines.append(f"{'Plugin ID:':<30} {self.globals[PLUGIN_INFO][PLUGIN_ID]}")
-                lines.append(f"{'Indigo Version:':<30} {indigo.server.version}")
-                lines.append(f"{'Indigo License:':<30} {indigo.server.licenseStatus}")
-                lines.append(f"{'Indigo API Version:':<30} {indigo.server.apiVersion}")
-                lines.append(f"{'Architecture:':<30} {platform.machine()}")
-                lines.append(f"{'Python Version:':<30} {sys.version.split(' ')[0]}")
-                lines.append(f"{'Mac OS Version:':<30} {platform.mac_ver()[0]}")
-                lines.append(f"{'Plugin Process ID:':<30} {os.getpid()}")
-                lines.append(f"{'SoCo Version:':<30} {soco_version}")
-                lines.append(f"{'SoCo Path:':<30} {soco_path}")
-
-                max_length = max(len(line) for line in lines[1:])  # Skip header
-                separator = f"{'':={'^'}{max_length}}"
-                return "\n".join([lines[0], separator] + lines[1:] + [separator])
+                name = self.globals[PLUGIN_INFO][PLUGIN_DISPLAY_NAME]
+                version = self.globals[PLUGIN_INFO][PLUGIN_VERSION]
+                rows = [
+                    ("Plugin",  f"{name} {version}  ({self.globals[PLUGIN_INFO][PLUGIN_ID]})"),
+                    ("Indigo",  f"{indigo.server.version}  ·  API {indigo.server.apiVersion}  ·  {indigo.server.licenseStatus}"),
+                    ("System",  f"Python {sys.version.split(' ')[0]}  ·  macOS {platform.mac_ver()[0]}  ·  {platform.machine()}"),
+                    ("SoCo",    f"{soco_version}"),
+                    ("Process", f"pid {os.getpid()}"),
+                ]
+                width = max(len(f"{label:<9} {value}") for label, value in rows) + 4
+                top = "╭" + "─" * width + "╮"
+                bot = "╰" + "─" * width + "╯"
+                body = [f"│  {label:<9} {value}" + " " * (width - 11 - len(value) - 1) + "│"
+                        for label, value in rows]
+                return "\n".join(["🎵 Sonos Plugin", top] + body + [bot])
 
             self.logger.info(plugin_information_message())
+            self.logger.debug(f"SoCo path: {soco_path}")
 
         except Exception as exception_error:
             self.exception_handler(exception_error, True)  # Log error and display failing statement

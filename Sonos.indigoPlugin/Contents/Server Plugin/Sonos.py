@@ -8549,7 +8549,7 @@ class SonosPlugin(object):
                     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                         s.connect((probe_ip, 1400))  # no packet sent — just resolves routing
                         found_ip = s.getsockname()[0]
-                    self.logger.info(
+                    self.logger.debug(
                         f"   ✅ No interface directly on {target_net}; Sonos subnet appears routed — "
                         f"using source IP {found_ip} (via route to {probe_ip})")
                     return found_ip
