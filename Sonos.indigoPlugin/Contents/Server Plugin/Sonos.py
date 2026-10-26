@@ -6963,7 +6963,7 @@ class SonosPlugin(object):
 
 
     def startup(self):
-        self.logger.info("🔌 Sonos Plugin Starting Up...")
+        self.logger.debug("🔌 Sonos Plugin Starting Up...")
 
 
         # at plugin start

@@ -107,7 +107,7 @@ class Plugin(indigo.PluginBase):
         self.indigo_log_handler.setLevel(LOG_LEVEL_INFO)   # Logging level for Indigo Event Log
 
         self.logger = logging.getLogger("Plugin.Sonos")
-        self.logger.info("Plugin logging now started.")
+        self.logger.debug("Plugin logging now started.")
 
         # Show the plugin info box FIRST — before SonosPlugin construction
         # produces any other output. Everything it needs (plugin globals,
@@ -197,7 +197,7 @@ class Plugin(indigo.PluginBase):
             self.Sound_Files = []
             list_count = 0
 
-            self.logger.info(f"🔍 Scanning for MP3s in: {self.SoundFilePath}")
+            self.logger.debug(f"🔍 Scanning for MP3s in: {self.SoundFilePath}")
 
             for f in listdir(self.SoundFilePath):
                 # Only files, and only .mp3
@@ -210,7 +210,7 @@ class Plugin(indigo.PluginBase):
                     # Ignore odd entries like __pycache__ dirs etc.
                     continue
 
-            self.logger.info(f"✅ Loaded Sound Files... [{list_count}]")
+            self.logger.debug(f"✅ Loaded Sound Files... [{list_count}]")
         except Exception as e:
             self.logger.error(f"❌ getSoundFiles() failed: {e}")
             self.Sound_Files = []
@@ -354,7 +354,7 @@ class Plugin(indigo.PluginBase):
 
     def startup(self):
         try:
-            self.logger.info("Plugin startup started.")
+            self.logger.debug("Plugin startup started.")
 
             if len(import_errors):
                 stop_message = "Plugin startup cancelled due to one or more required plugin Python libraries missing:\n"
@@ -373,7 +373,7 @@ class Plugin(indigo.PluginBase):
             #for dev in indigo.devices.iter("com.ssi.indigoplugin.Sonos"):
             #    self.logger.warning(f"Device '{dev.name}' states: {list(dev.states.keys())}") 
 
-            self.logger.info("Plugin startup ended.")
+            self.logger.debug("Plugin startup ended.")
 
         except Exception as exception_error:
             self.exception_handler(exception_error, True)  # Log error and display failing statement
