@@ -315,7 +315,10 @@ class Plugin(indigo.PluginBase):
                 bot = "╰" + "─" * width + "╯"
                 body = [f"│  {label:<9} {value}" + " " * (width - 11 - len(value) - 1) + "│"
                         for label, value in rows]
-                return "\n".join(["🎵 Sonos Plugin", top] + body + [bot])
+                # Indent continuation lines to sit under the Event Log's
+                # message column (first line gets Indigo's own prefix).
+                pad = " " * 35
+                return "\n".join(["🎵 Sonos Plugin"] + [pad + line for line in [top] + body + [bot]])
 
             self.logger.info(plugin_information_message())
             self.logger.debug(f"SoCo path: {soco_path}")

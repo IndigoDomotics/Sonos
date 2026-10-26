@@ -12643,7 +12643,7 @@ class SonosPlugin(object):
         if deleted > 0:
             self.logger.debug(f"🧹 Artwork cleanup done: {deleted} file(s) removed.")
         else:
-            self.logger.info("🧹 No stale artwork files found.")
+            self.logger.debug("🧹 No stale artwork files found.")
 
 
 
